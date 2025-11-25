@@ -18,7 +18,11 @@ import librosa
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from sklearn.metrics import f1_score, confusion_matrix
+from tqdm import tqdm
 
 # Data paths
 # You can either:
@@ -26,7 +30,15 @@ from torch.utils.data import DataLoader, Dataset
 # - directly replace "Your Path" with the absolute path to the dataset root.
 BASE_DIR = Path(os.getenv("MLFA25_BASE_DIR", "Your Path"))
 TRAIN_CSV = BASE_DIR / "metadata" / "kaggle_train.csv"
+TEST_CSV = BASE_DIR / "metadata" / "kaggle_test.csv"
 AUDIO_DIR = BASE_DIR / "audio"
+TEST_AUDIO_DIR = AUDIO_DIR / "test"
+
+# Number of classes
+NUM_CLASSES = 10
+
+# Device configuration
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Default audio / feature configuration for Phase 1
 AUDIO_CONFIG = {
@@ -385,13 +397,463 @@ def main():
 if __name__ == "__main__":
     main()
 
-# Finish your dataloader
+
+# =============================================================================
+# Test Dataset (for inference)
+# =============================================================================
+
+class UrbanSoundTestDataset(Dataset):
+    """
+    PyTorch Dataset for test set (no labels).
+    Reads kaggle_test.csv and returns (Log-Mel spectrogram tensor, file_name).
+    """
+
+    def __init__(
+        self,
+        csv_path: Path = TEST_CSV,
+        audio_dir: Path = TEST_AUDIO_DIR,
+        audio_config=None,
+        cache_dir: Path | None = None,
+    ):
+        self.csv_path = Path(csv_path)
+        self.audio_dir = Path(audio_dir)
+        self.df = pd.read_csv(self.csv_path)
+        self.audio_config = audio_config or AUDIO_CONFIG
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        if self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def __len__(self):
+        return len(self.df)
+
+    def _cache_path(self, file_name):
+        if self.cache_dir is None:
+            return None
+        stem = Path(file_name).stem
+        return self.cache_dir / f"mel_test_{stem}.npy"
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        file_name = row["slice_file_name"]
+
+        cache_path = self._cache_path(file_name)
+        if cache_path is not None and cache_path.exists():
+            mel = np.load(cache_path)
+        else:
+            audio_path = self.audio_dir / file_name
+            if not audio_path.exists():
+                raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+            mel, _, _ = compute_log_mel_spectrogram(
+                audio_path,
+                config=self.audio_config,
+                normalize=True,
+            )
+
+            if cache_path is not None:
+                np.save(cache_path, mel)
+
+        mel_tensor = torch.from_numpy(mel).unsqueeze(0)  # [1, 128, T]
+        return mel_tensor, file_name
 
 
-# Finish your model class
+def create_test_dataloader(batch_size=32, num_workers=0, cache_dir: Path | None = None):
+    """
+    Create DataLoader for test set inference.
+    """
+    test_dataset = UrbanSoundTestDataset(
+        csv_path=TEST_CSV,
+        audio_dir=TEST_AUDIO_DIR,
+        audio_config=AUDIO_CONFIG,
+        cache_dir=cache_dir,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+    return test_loader
 
 
-# Train & Eval
+# =============================================================================
+# CNN Model
+# =============================================================================
+
+class AudioCNN(nn.Module):
+    """
+    Simple CNN for audio classification using Mel spectrograms.
+    Input shape: (batch, 1, n_mels=128, time_frames)
+    Output: (batch, num_classes=10)
+    """
+
+    def __init__(self, num_classes=NUM_CLASSES):
+        super(AudioCNN, self).__init__()
+
+        # Convolutional layers
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.pool1 = nn.MaxPool2d(2, 2)
+
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.pool2 = nn.MaxPool2d(2, 2)
+
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.pool3 = nn.MaxPool2d(2, 2)
+
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+        self.bn4 = nn.BatchNorm2d(256)
+        self.pool4 = nn.MaxPool2d(2, 2)
+
+        # Global Average Pooling
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        # Fully connected layers
+        self.fc1 = nn.Linear(256, 128)
+        self.dropout = nn.Dropout(0.5)
+        self.fc2 = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        # Conv block 1
+        x = self.pool1(F.relu(self.bn1(self.conv1(x))))
+        # Conv block 2
+        x = self.pool2(F.relu(self.bn2(self.conv2(x))))
+        # Conv block 3
+        x = self.pool3(F.relu(self.bn3(self.conv3(x))))
+        # Conv block 4
+        x = self.pool4(F.relu(self.bn4(self.conv4(x))))
+
+        # Global average pooling
+        x = self.global_pool(x)
+        x = x.view(x.size(0), -1)
+
+        # Fully connected
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+
+        return x
 
 
-# Submit your csv file to kaggle
+# =============================================================================
+# Training & Evaluation
+# =============================================================================
+
+def train_one_epoch(model, train_loader, criterion, optimizer, device):
+    """
+    Train for one epoch.
+    """
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    pbar = tqdm(train_loader, desc="Training")
+    for inputs, targets in pbar:
+        inputs, targets = inputs.to(device), targets.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * inputs.size(0)
+        _, predicted = outputs.max(1)
+        total += targets.size(0)
+        correct += predicted.eq(targets).sum().item()
+
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'acc': f'{100. * correct / total:.2f}%'
+        })
+
+    epoch_loss = running_loss / total
+    epoch_acc = correct / total
+    return epoch_loss, epoch_acc
+
+
+def evaluate(model, val_loader, criterion, device):
+    """
+    Evaluate model on validation set.
+    Returns loss, accuracy, macro-F1, and predictions.
+    """
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for inputs, targets in tqdm(val_loader, desc="Evaluating"):
+            inputs, targets = inputs.to(device), targets.to(device)
+
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+
+            running_loss += loss.item() * inputs.size(0)
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+
+            all_preds.extend(predicted.cpu().numpy())
+            all_targets.extend(targets.cpu().numpy())
+
+    epoch_loss = running_loss / total
+    epoch_acc = correct / total
+    macro_f1 = f1_score(all_targets, all_preds, average='macro')
+
+    # Weighted score (80% accuracy + 20% macro-F1)
+    weighted_score = 0.8 * epoch_acc + 0.2 * macro_f1
+
+    return epoch_loss, epoch_acc, macro_f1, weighted_score, all_preds, all_targets
+
+
+def train_model(
+    model,
+    train_loader,
+    val_loader,
+    num_epochs=50,
+    learning_rate=1e-3,
+    device=DEVICE,
+    save_path="best_model.pth",
+):
+    """
+    Full training loop with validation and model saving.
+    """
+    model = model.to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=5, verbose=True
+    )
+
+    best_score = 0.0
+    history = {
+        'train_loss': [], 'train_acc': [],
+        'val_loss': [], 'val_acc': [], 'val_f1': [], 'val_score': []
+    }
+
+    print(f"\nTraining on {device}")
+    print(f"Train samples: {len(train_loader.dataset)}")
+    print(f"Val samples: {len(val_loader.dataset)}")
+    print("=" * 60)
+
+    for epoch in range(num_epochs):
+        print(f"\nEpoch {epoch + 1}/{num_epochs}")
+        print("-" * 40)
+
+        # Train
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, criterion, optimizer, device
+        )
+
+        # Validate
+        val_loss, val_acc, val_f1, val_score, _, _ = evaluate(
+            model, val_loader, criterion, device
+        )
+
+        # Update scheduler
+        scheduler.step(val_score)
+
+        # Save history
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        history['val_f1'].append(val_f1)
+        history['val_score'].append(val_score)
+
+        print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
+        print(f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | "
+              f"Val F1: {val_f1:.4f} | Score: {val_score:.4f}")
+
+        # Save best model
+        if val_score > best_score:
+            best_score = val_score
+            torch.save(model.state_dict(), save_path)
+            print(f"*** Best model saved (score: {best_score:.4f}) ***")
+
+    print("\n" + "=" * 60)
+    print(f"Training complete! Best score: {best_score:.4f}")
+    print(f"Model saved to: {save_path}")
+
+    return history
+
+
+# =============================================================================
+# Inference & Submission
+# =============================================================================
+
+def predict(model, test_loader, device=DEVICE):
+    """
+    Generate predictions for test set.
+    Returns list of (file_name, predicted_class_id).
+    """
+    model = model.to(device)
+    model.eval()
+
+    predictions = []
+
+    with torch.no_grad():
+        for inputs, file_names in tqdm(test_loader, desc="Predicting"):
+            inputs = inputs.to(device)
+            outputs = model(inputs)
+            _, predicted = outputs.max(1)
+
+            for fname, pred in zip(file_names, predicted.cpu().numpy()):
+                predictions.append((fname, int(pred)))
+
+    return predictions
+
+
+def generate_submission(predictions, output_path="submission.csv"):
+    """
+    Generate Kaggle submission CSV file.
+
+    Args:
+        predictions: list of (file_name, predicted_class_id)
+        output_path: path to save CSV file
+    """
+    df = pd.DataFrame(predictions, columns=["slice_file_name", "classID"])
+    df.to_csv(output_path, index=False)
+    print(f"Submission saved to: {output_path}")
+    print(f"Total predictions: {len(df)}")
+    return df
+
+
+# =============================================================================
+# Main Training Script
+# =============================================================================
+
+def run_training(
+    train_folds=(1, 2, 3, 4, 5, 6, 7),
+    val_folds=(8,),
+    batch_size=32,
+    num_epochs=50,
+    learning_rate=1e-3,
+    cache_dir=None,
+):
+    """
+    Complete training pipeline.
+    """
+    print("=" * 60)
+    print("Urban Sound Classification - Training")
+    print("=" * 60)
+
+    # Setup cache directory
+    if cache_dir is None:
+        cache_dir = BASE_DIR / "mel_cache"
+
+    # Create data loaders
+    print("\nCreating data loaders...")
+    train_loader, val_loader = create_train_val_dataloaders(
+        train_folds=train_folds,
+        val_folds=val_folds,
+        batch_size=batch_size,
+        num_workers=0,
+        cache_dir=cache_dir,
+    )
+
+    # Create model
+    print("\nInitializing model...")
+    model = AudioCNN(num_classes=NUM_CLASSES)
+    print(model)
+
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\nTotal parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+
+    # Train
+    history = train_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        num_epochs=num_epochs,
+        learning_rate=learning_rate,
+        device=DEVICE,
+        save_path="best_model.pth",
+    )
+
+    return model, history
+
+
+def run_inference(model_path="best_model.pth", output_path="submission.csv", cache_dir=None):
+    """
+    Complete inference pipeline.
+    """
+    print("=" * 60)
+    print("Urban Sound Classification - Inference")
+    print("=" * 60)
+
+    # Setup cache directory
+    if cache_dir is None:
+        cache_dir = BASE_DIR / "mel_cache"
+
+    # Load model
+    print("\nLoading model...")
+    model = AudioCNN(num_classes=NUM_CLASSES)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    model = model.to(DEVICE)
+    print(f"Model loaded from: {model_path}")
+
+    # Create test loader
+    print("\nCreating test data loader...")
+    test_loader = create_test_dataloader(
+        batch_size=32,
+        num_workers=0,
+        cache_dir=cache_dir,
+    )
+    print(f"Test samples: {len(test_loader.dataset)}")
+
+    # Generate predictions
+    print("\nGenerating predictions...")
+    predictions = predict(model, test_loader, device=DEVICE)
+
+    # Save submission
+    df = generate_submission(predictions, output_path=output_path)
+
+    return df
+
+
+# =============================================================================
+# Entry Point for Training & Inference
+# =============================================================================
+
+def run_full_pipeline():
+    """
+    Run the complete pipeline: training + inference.
+    """
+    # Check if data exists
+    if not TRAIN_CSV.exists():
+        print(f"Error: Training CSV not found at {TRAIN_CSV}")
+        print("Please set MLFA25_BASE_DIR environment variable or update BASE_DIR in the code.")
+        return
+
+    # Training
+    model, history = run_training(
+        train_folds=(1, 2, 3, 4, 5, 6, 7),
+        val_folds=(8,),
+        batch_size=32,
+        num_epochs=50,
+        learning_rate=1e-3,
+    )
+
+    # Inference
+    if TEST_CSV.exists():
+        df = run_inference(
+            model_path="best_model.pth",
+            output_path="submission.csv",
+        )
+    else:
+        print(f"\nWarning: Test CSV not found at {TEST_CSV}")
+        print("Skipping inference step.")
+
+
+# Uncomment to run the full pipeline:
+# run_full_pipeline()

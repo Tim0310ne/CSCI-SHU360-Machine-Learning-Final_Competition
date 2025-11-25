@@ -1,0 +1,22 @@
+name: mlfa25
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch::pytorch=2.0.1
+  - pytorch::torchvision=0.15.2
+  - pytorch::torchaudio=2.0.2
+  - pytorch::pytorch-cuda=11.7
+  - numpy<2.0
+  - pandas
+  - scikit-learn
+  - tqdm
+  - matplotlib
+  - librosa
+  - pip
+  - pip:
+    - soundfile
+
