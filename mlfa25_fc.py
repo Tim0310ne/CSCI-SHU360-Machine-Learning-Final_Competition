@@ -12,6 +12,7 @@ One piece of audio = One piece of image
 """
 
 import os
+import zipfile
 from pathlib import Path
 
 import librosa
@@ -28,7 +29,20 @@ from tqdm import tqdm
 # You can either:
 # - set the environment variable MLFA25_BASE_DIR to your dataset root, or
 # - directly replace "Your Path" with the absolute path to the dataset root.
-BASE_DIR = Path(os.getenv("MLFA25_BASE_DIR", "Your Path"))
+# Default to "Kaggle_Data" in the current directory if not set
+BASE_DIR = Path(os.getenv("MLFA25_BASE_DIR", Path(__file__).parent / "Kaggle_Data"))
+
+# Check if we need to unzip
+if not BASE_DIR.exists():
+    zip_path = BASE_DIR.parent / "Kaggle_Data.zip"
+    if zip_path.exists():
+        print(f"Found {zip_path}, extracting...")
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(BASE_DIR.parent)
+        print("Extraction complete!")
+    else:
+        print(f"Warning: Dataset not found at {BASE_DIR} and no zip file at {zip_path}")
+
 TRAIN_CSV = BASE_DIR / "metadata" / "kaggle_train.csv"
 TEST_CSV = BASE_DIR / "metadata" / "kaggle_test.csv"
 AUDIO_DIR = BASE_DIR / "audio"
