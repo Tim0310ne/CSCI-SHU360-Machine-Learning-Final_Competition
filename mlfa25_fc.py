@@ -855,5 +855,5 @@ def run_full_pipeline():
         print("Skipping inference step.")
 
 
-# Uncomment to run the full pipeline:
-# run_full_pipeline()
+
+run_full_pipeline()
