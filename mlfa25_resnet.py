@@ -2,10 +2,12 @@
 """
 Urban Sound Classification with ResNet Architecture
 Based on mlfa25_fc.py - keeps data loading/processing, replaces CNN with ResNet
+Enhanced with: SpecAugment, Mixup, Label Smoothing, Cross-Validation Ensemble
 """
 
 import os
 import zipfile
+import random
 from pathlib import Path
 
 import librosa
@@ -56,6 +58,94 @@ AUDIO_CONFIG = {
     "duration": 4.0,  # seconds, None means use full clip
     "fmax": 8000,
 }
+
+
+# =============================================================================
+# Data Augmentation
+# =============================================================================
+
+class SpecAugment:
+    """
+    SpecAugment: A Simple Data Augmentation Method for ASR
+    Applies time and frequency masking to spectrograms.
+    """
+    def __init__(self, freq_mask_param=20, time_mask_param=40, 
+                 num_freq_masks=2, num_time_masks=2):
+        self.freq_mask_param = freq_mask_param
+        self.time_mask_param = time_mask_param
+        self.num_freq_masks = num_freq_masks
+        self.num_time_masks = num_time_masks
+    
+    def __call__(self, mel_spec):
+        """
+        Args:
+            mel_spec: tensor of shape (1, n_mels, time) or (n_mels, time)
+        Returns:
+            Augmented mel spectrogram
+        """
+        if len(mel_spec.shape) == 2:
+            mel_spec = mel_spec.unsqueeze(0)
+        
+        _, n_mels, time_steps = mel_spec.shape
+        augmented = mel_spec.clone()
+        
+        # Frequency masking
+        for _ in range(self.num_freq_masks):
+            f = random.randint(0, min(self.freq_mask_param, n_mels - 1))
+            f0 = random.randint(0, n_mels - f)
+            augmented[:, f0:f0 + f, :] = 0
+        
+        # Time masking
+        for _ in range(self.num_time_masks):
+            t = random.randint(0, min(self.time_mask_param, time_steps - 1))
+            t0 = random.randint(0, time_steps - t)
+            augmented[:, :, t0:t0 + t] = 0
+        
+        return augmented.squeeze(0) if len(mel_spec.shape) == 2 else augmented
+
+
+def mixup_data(x, y, alpha=0.4):
+    """
+    Mixup augmentation: creates virtual training examples.
+    """
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(x.device)
+
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """Loss function for mixup."""
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+
+class LabelSmoothingCrossEntropy(nn.Module):
+    """
+    Cross entropy loss with label smoothing.
+    """
+    def __init__(self, smoothing=0.1):
+        super().__init__()
+        self.smoothing = smoothing
+    
+    def forward(self, pred, target):
+        n_classes = pred.size(-1)
+        log_preds = F.log_softmax(pred, dim=-1)
+        
+        # Create smoothed labels
+        with torch.no_grad():
+            true_dist = torch.zeros_like(log_preds)
+            true_dist.fill_(self.smoothing / (n_classes - 1))
+            true_dist.scatter_(1, target.unsqueeze(1), 1.0 - self.smoothing)
+        
+        return (-true_dist * log_preds).sum(dim=-1).mean()
+
 
 def audio_to_mel_spectrogram(audio_path, sr=22050, n_mels=128, n_fft=2048,
                              hop_length=512, duration=None, fmax=8000):
@@ -140,6 +230,7 @@ class UrbanSoundDataset(Dataset):
     """
     PyTorch Dataset that reads kaggle_train.csv and returns
     (Log-Mel spectrogram tensor, classID).
+    Supports SpecAugment for training.
     """
 
     def __init__(
@@ -149,6 +240,7 @@ class UrbanSoundDataset(Dataset):
         folds=None,
         audio_config=None,
         cache_dir: Path | None = None,
+        augment: bool = False,
     ):
         self.csv_path = Path(csv_path)
         self.audio_dir = Path(audio_dir)
@@ -161,6 +253,15 @@ class UrbanSoundDataset(Dataset):
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Augmentation
+        self.augment = augment
+        self.spec_augment = SpecAugment(
+            freq_mask_param=15,
+            time_mask_param=35,
+            num_freq_masks=2,
+            num_time_masks=2
+        ) if augment else None
 
     def __len__(self):
         return len(self.df)
@@ -196,6 +297,11 @@ class UrbanSoundDataset(Dataset):
 
         # (n_mels, time) -> (1, n_mels, time) for CNN input
         mel_tensor = torch.from_numpy(mel).unsqueeze(0)  # [1, 128, T]
+        
+        # Apply SpecAugment during training
+        if self.augment and self.spec_augment is not None:
+            mel_tensor = self.spec_augment(mel_tensor)
+        
         label_tensor = torch.tensor(class_id, dtype=torch.long)
         return mel_tensor, label_tensor
 
@@ -261,6 +367,7 @@ def create_train_val_dataloaders(
     batch_size=32,
     num_workers=0,
     cache_dir: Path | None = None,
+    augment: bool = True,
 ):
     """
     Convenience function to build train/val DataLoaders for Phase 1.
@@ -271,6 +378,7 @@ def create_train_val_dataloaders(
         folds=list(train_folds),
         audio_config=AUDIO_CONFIG,
         cache_dir=cache_dir,
+        augment=augment,  # Enable augmentation for training
     )
     val_dataset = UrbanSoundDataset(
         csv_path=TRAIN_CSV,
@@ -278,6 +386,7 @@ def create_train_val_dataloaders(
         folds=list(val_folds),
         audio_config=AUDIO_CONFIG,
         cache_dir=cache_dir,
+        augment=False,  # No augmentation for validation
     )
 
     train_loader = DataLoader(
@@ -578,9 +687,9 @@ def resnet_light_audio(num_classes=NUM_CLASSES):
 # Training & Evaluation Functions
 # =============================================================================
 
-def train_one_epoch(model, train_loader, criterion, optimizer, device):
+def train_one_epoch(model, train_loader, criterion, optimizer, device, use_mixup=True, mixup_alpha=0.4):
     """
-    Train for one epoch.
+    Train for one epoch with optional mixup augmentation.
     """
     model.train()
     running_loss = 0.0
@@ -592,15 +701,27 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device):
         inputs, targets = inputs.to(device), targets.to(device)
 
         optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
+        
+        # Apply mixup with some probability
+        if use_mixup and random.random() > 0.5:
+            inputs, targets_a, targets_b, lam = mixup_data(inputs, targets, mixup_alpha)
+            outputs = model(inputs)
+            loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
+            # For accuracy calculation, use the dominant target
+            _, predicted = outputs.max(1)
+            correct += (lam * predicted.eq(targets_a).sum().item() + 
+                       (1 - lam) * predicted.eq(targets_b).sum().item())
+        else:
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            _, predicted = outputs.max(1)
+            correct += predicted.eq(targets).sum().item()
+        
         loss.backward()
         optimizer.step()
 
         running_loss += loss.item() * inputs.size(0)
-        _, predicted = outputs.max(1)
         total += targets.size(0)
-        correct += predicted.eq(targets).sum().item()
 
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
@@ -658,14 +779,25 @@ def train_model(
     weight_decay=1e-4,
     device=DEVICE,
     save_path="best_resnet_model.pth",
+    use_mixup=True,
+    label_smoothing=0.1,
 ):
     """
     Full training loop with validation and model saving.
+    Includes label smoothing and mixup augmentation.
     """
     model = model.to(device)
-    criterion = nn.CrossEntropyLoss()
+    
+    # Use label smoothing for training, regular CE for validation
+    train_criterion = LabelSmoothingCrossEntropy(smoothing=label_smoothing)
+    val_criterion = nn.CrossEntropyLoss()
+    
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    
+    # Cosine annealing with warm restarts for better convergence
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=10, T_mult=2, eta_min=1e-6
+    )
 
     best_score = 0.0
     history = {
@@ -676,20 +808,22 @@ def train_model(
     print(f"\nTraining on {device}")
     print(f"Train samples: {len(train_loader.dataset)}")
     print(f"Val samples: {len(val_loader.dataset)}")
+    print(f"Using mixup: {use_mixup}, Label smoothing: {label_smoothing}")
     print("=" * 60)
 
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch + 1}/{num_epochs}")
         print("-" * 40)
 
-        # Train
+        # Train with mixup and label smoothing
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, device
+            model, train_loader, train_criterion, optimizer, device, 
+            use_mixup=use_mixup
         )
 
-        # Validate
+        # Validate (use regular CE loss for validation)
         val_loss, val_acc, val_f1, val_score, _, _ = evaluate(
-            model, val_loader, criterion, device
+            model, val_loader, val_criterion, device
         )
 
         # Update scheduler
@@ -814,7 +948,7 @@ def run_training(
     if cache_dir is None:
         cache_dir = BASE_DIR / "mel_cache"
 
-    # Create data loaders
+    # Create data loaders with augmentation
     print("\nCreating data loaders...")
     train_loader, val_loader = create_train_val_dataloaders(
         train_folds=train_folds,
@@ -822,20 +956,12 @@ def run_training(
         batch_size=batch_size,
         num_workers=0,
         cache_dir=cache_dir,
+        augment=True,  # Enable SpecAugment for training
     )
 
     # Create model
     print(f"\nInitializing {model_type} model...")
-    if model_type == "resnet18":
-        model = resnet18_audio(num_classes=NUM_CLASSES)
-    elif model_type == "resnet34":
-        model = resnet34_audio(num_classes=NUM_CLASSES)
-    elif model_type == "resnet_small":
-        model = resnet_small_audio(num_classes=NUM_CLASSES)
-    elif model_type == "resnet_light":
-        model = resnet_light_audio(num_classes=NUM_CLASSES)
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
+    model = create_model(model_type)
     
     print(model)
 
@@ -845,7 +971,7 @@ def run_training(
     print(f"\nTotal parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
 
-    # Train
+    # Train with mixup and label smoothing
     history = train_model(
         model=model,
         train_loader=train_loader,
@@ -855,6 +981,8 @@ def run_training(
         weight_decay=weight_decay,
         device=DEVICE,
         save_path="best_resnet_model.pth",
+        use_mixup=True,
+        label_smoothing=0.1,
     )
 
     return model, history
@@ -875,17 +1003,7 @@ def run_inference(model_path="best_resnet_model.pth", output_path="submission.cs
 
     # Load model
     print("\nLoading model...")
-    if model_type == "resnet18":
-        model = resnet18_audio(num_classes=NUM_CLASSES)
-    elif model_type == "resnet34":
-        model = resnet34_audio(num_classes=NUM_CLASSES)
-    elif model_type == "resnet_small":
-        model = resnet_small_audio(num_classes=NUM_CLASSES)
-    elif model_type == "resnet_light":
-        model = resnet_light_audio(num_classes=NUM_CLASSES)
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
-        
+    model = create_model(model_type)
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     model = model.to(DEVICE)
     print(f"Model loaded from: {model_path}")
@@ -910,6 +1028,160 @@ def run_inference(model_path="best_resnet_model.pth", output_path="submission.cs
 
 
 # =============================================================================
+# Cross-Validation Ensemble
+# =============================================================================
+
+def create_model(model_type):
+    """Create a fresh model instance."""
+    if model_type == "resnet18":
+        return resnet18_audio(num_classes=NUM_CLASSES)
+    elif model_type == "resnet34":
+        return resnet34_audio(num_classes=NUM_CLASSES)
+    elif model_type == "resnet_small":
+        return resnet_small_audio(num_classes=NUM_CLASSES)
+    elif model_type == "resnet_light":
+        return resnet_light_audio(num_classes=NUM_CLASSES)
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+
+
+def predict_proba(model, test_loader, device=DEVICE):
+    """
+    Generate probability predictions for test set.
+    Returns: (file_names, probabilities array)
+    """
+    model = model.to(device)
+    model.eval()
+    
+    all_probs = []
+    all_names = []
+    
+    with torch.no_grad():
+        for inputs, file_names in tqdm(test_loader, desc="Predicting"):
+            inputs = inputs.to(device)
+            outputs = model(inputs)
+            probs = F.softmax(outputs, dim=1)
+            
+            all_probs.append(probs.cpu().numpy())
+            all_names.extend(file_names)
+    
+    return all_names, np.vstack(all_probs)
+
+
+def run_cv_ensemble(
+    model_type="resnet_light",
+    num_epochs=30,
+    batch_size=32,
+    learning_rate=1e-3,
+    n_folds=8,
+    output_path="submission.csv",
+):
+    """
+    Train models using cross-validation and ensemble predictions.
+    This typically improves performance by 2-5%.
+    """
+    print("=" * 60)
+    print("Urban Sound Classification - Cross-Validation Ensemble")
+    print("=" * 60)
+    
+    if not TRAIN_CSV.exists():
+        print(f"Error: Training CSV not found at {TRAIN_CSV}")
+        return
+    
+    cache_dir = BASE_DIR / "mel_cache"
+    all_folds = list(range(1, n_folds + 1))
+    
+    # Store models for ensemble
+    models = []
+    val_scores = []
+    
+    for fold_idx, val_fold in enumerate(all_folds):
+        print(f"\n{'='*60}")
+        print(f"Training Fold {fold_idx + 1}/{n_folds} (Validation fold: {val_fold})")
+        print("=" * 60)
+        
+        train_folds = [f for f in all_folds if f != val_fold]
+        
+        # Create data loaders
+        train_loader, val_loader = create_train_val_dataloaders(
+            train_folds=train_folds,
+            val_folds=(val_fold,),
+            batch_size=batch_size,
+            num_workers=0,
+            cache_dir=cache_dir,
+            augment=True,
+        )
+        
+        # Create fresh model
+        model = create_model(model_type)
+        
+        # Train
+        save_path = f"model_fold{val_fold}.pth"
+        history = train_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            num_epochs=num_epochs,
+            learning_rate=learning_rate,
+            weight_decay=1e-4,
+            device=DEVICE,
+            save_path=save_path,
+            use_mixup=True,
+            label_smoothing=0.1,
+        )
+        
+        # Load best model
+        model.load_state_dict(torch.load(save_path, map_location=DEVICE))
+        models.append(model)
+        val_scores.append(max(history['val_score']))
+        
+        print(f"Fold {fold_idx + 1} best score: {max(history['val_score']):.4f}")
+    
+    print("\n" + "=" * 60)
+    print("Cross-Validation Results")
+    print("=" * 60)
+    print(f"Mean CV Score: {np.mean(val_scores):.4f} ± {np.std(val_scores):.4f}")
+    print(f"Individual scores: {[f'{s:.4f}' for s in val_scores]}")
+    
+    # Ensemble inference
+    if TEST_CSV.exists():
+        print("\n" + "=" * 60)
+        print("Ensemble Inference")
+        print("=" * 60)
+        
+        test_loader = create_test_dataloader(
+            batch_size=batch_size,
+            num_workers=0,
+            cache_dir=cache_dir,
+        )
+        
+        # Get predictions from all models
+        all_probs = []
+        file_names = None
+        
+        for i, model in enumerate(models):
+            print(f"Getting predictions from model {i + 1}/{len(models)}...")
+            names, probs = predict_proba(model, test_loader, device=DEVICE)
+            all_probs.append(probs)
+            if file_names is None:
+                file_names = names
+        
+        # Average probabilities
+        avg_probs = np.mean(all_probs, axis=0)
+        predictions = [(name, int(np.argmax(avg_probs[i]))) 
+                      for i, name in enumerate(file_names)]
+        
+        # Generate submission
+        df = generate_submission(predictions, output_path=output_path)
+        
+        print(f"\nEnsemble submission saved to: {output_path}")
+    else:
+        print(f"\nWarning: Test CSV not found at {TEST_CSV}")
+    
+    return models, val_scores
+
+
+# =============================================================================
 # Entry Point for Training & Inference
 # =============================================================================
 
@@ -918,7 +1190,7 @@ def run_full_pipeline(model_type="resnet18", num_epochs=50):
     Run the complete pipeline: training + inference.
     
     Args:
-        model_type: "resnet18", "resnet34", or "resnet_small"
+        model_type: "resnet18", "resnet34", "resnet_small", or "resnet_light"
         num_epochs: Number of training epochs
     """
     # Check if data exists
@@ -951,10 +1223,17 @@ def run_full_pipeline(model_type="resnet18", num_epochs=50):
 
 
 if __name__ == "__main__":
-    # Available models:
-    # - "resnet_light": Recommended for audio (less aggressive downsampling)
-    # - "resnet18": Standard ResNet-18 adapted for audio
-    # - "resnet34": Deeper model
-    # - "resnet_small": Smaller/faster model
-    run_full_pipeline(model_type="resnet_light", num_epochs=30)
+    # Option 1: Single model training (faster, for testing)
+    # run_full_pipeline(model_type="resnet_light", num_epochs=30)
+    
+    # Option 2: Cross-validation ensemble (better performance, recommended)
+    # This trains 8 models and averages their predictions
+    run_cv_ensemble(
+        model_type="resnet_light",
+        num_epochs=40,
+        batch_size=32,
+        learning_rate=1e-3,
+        n_folds=8,
+        output_path="submission.csv",
+    )
 
