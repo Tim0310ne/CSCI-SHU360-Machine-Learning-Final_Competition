@@ -383,7 +383,7 @@ class Bottleneck(nn.Module):
         out = self.bn2(out)
         out = self.relu(out)
 
-        out = self.conv3(x)
+        out = self.conv3(out)  # Fixed: was self.conv3(x)
         out = self.bn3(out)
 
         if self.downsample is not None:
@@ -402,6 +402,7 @@ class AudioResNet(nn.Module):
     Output: (batch, num_classes=10)
     
     This is a ResNet-18 style architecture adapted for 1-channel audio spectrograms.
+    Modified for audio: uses smaller initial kernel to preserve frequency information.
     Trained from scratch (no pretrained weights).
     """
 
@@ -411,12 +412,15 @@ class AudioResNet(nn.Module):
         
         self.in_channels = base_channels
         
-        # Initial convolution layer (adapted for 1-channel input)
-        self.conv1 = nn.Conv2d(in_channels, base_channels, kernel_size=7, 
-                               stride=2, padding=3, bias=False)
+        # Initial convolution layer - MODIFIED for audio spectrograms:
+        # Use 3x3 kernel instead of 7x7 to preserve more frequency detail
+        # Use stride=1 initially to keep more spatial information
+        self.conv1 = nn.Conv2d(in_channels, base_channels, kernel_size=3, 
+                               stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(base_channels)
         self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        # Use smaller pooling to preserve more information
+        self.maxpool = nn.MaxPool2d(kernel_size=2, stride=2)
         
         # Residual layers
         self.layer1 = self._make_layer(block, base_channels, layers[0])
@@ -493,6 +497,81 @@ def resnet34_audio(num_classes=NUM_CLASSES):
 def resnet_small_audio(num_classes=NUM_CLASSES):
     """Smaller ResNet for faster training - good for initial experiments"""
     return AudioResNet(BasicBlock, [1, 1, 1, 1], num_classes=num_classes, base_channels=32)
+
+
+class AudioResNetLight(nn.Module):
+    """
+    Lighter ResNet specifically designed for audio mel spectrograms.
+    Less aggressive downsampling, fewer parameters, better suited for this task.
+    """
+    
+    def __init__(self, num_classes=NUM_CLASSES):
+        super(AudioResNetLight, self).__init__()
+        
+        # Initial feature extraction (no aggressive downsampling)
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.relu = nn.ReLU(inplace=True)
+        
+        # Residual blocks with gradual downsampling
+        self.layer1 = self._make_layer(32, 64, stride=2)   # 128 -> 64
+        self.layer2 = self._make_layer(64, 128, stride=2)  # 64 -> 32
+        self.layer3 = self._make_layer(128, 256, stride=2) # 32 -> 16
+        self.layer4 = self._make_layer(256, 512, stride=2) # 16 -> 8
+        
+        # Global pooling and classifier
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.dropout = nn.Dropout(0.5)
+        self.fc = nn.Linear(512, num_classes)
+        
+        self._initialize_weights()
+    
+    def _make_layer(self, in_channels, out_channels, stride=1):
+        """Create a residual layer with 2 blocks"""
+        downsample = None
+        if stride != 1 or in_channels != out_channels:
+            downsample = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+        
+        layers = [BasicBlock(in_channels, out_channels, stride, downsample)]
+        layers.append(BasicBlock(out_channels, out_channels))
+        
+        return nn.Sequential(*layers)
+    
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.dropout(x)
+        x = self.fc(x)
+        
+        return x
+
+
+def resnet_light_audio(num_classes=NUM_CLASSES):
+    """Light ResNet designed for audio - recommended for this task"""
+    return AudioResNetLight(num_classes=num_classes)
 
 
 # =============================================================================
@@ -753,6 +832,8 @@ def run_training(
         model = resnet34_audio(num_classes=NUM_CLASSES)
     elif model_type == "resnet_small":
         model = resnet_small_audio(num_classes=NUM_CLASSES)
+    elif model_type == "resnet_light":
+        model = resnet_light_audio(num_classes=NUM_CLASSES)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
     
@@ -800,6 +881,8 @@ def run_inference(model_path="best_resnet_model.pth", output_path="submission.cs
         model = resnet34_audio(num_classes=NUM_CLASSES)
     elif model_type == "resnet_small":
         model = resnet_small_audio(num_classes=NUM_CLASSES)
+    elif model_type == "resnet_light":
+        model = resnet_light_audio(num_classes=NUM_CLASSES)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
         
@@ -868,7 +951,10 @@ def run_full_pipeline(model_type="resnet18", num_epochs=50):
 
 
 if __name__ == "__main__":
-    # Run with ResNet-18 by default
-    # You can change to "resnet34" for a deeper model or "resnet_small" for faster training
-    run_full_pipeline(model_type="resnet18", num_epochs=50)
+    # Available models:
+    # - "resnet_light": Recommended for audio (less aggressive downsampling)
+    # - "resnet18": Standard ResNet-18 adapted for audio
+    # - "resnet34": Deeper model
+    # - "resnet_small": Smaller/faster model
+    run_full_pipeline(model_type="resnet_light", num_epochs=30)
 
