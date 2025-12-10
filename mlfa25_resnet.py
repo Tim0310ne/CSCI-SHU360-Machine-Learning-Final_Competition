@@ -398,10 +398,11 @@ def create_train_val_dataloaders(
     batch_size=32,
     num_workers=0,
     cache_dir: Path | None = None,
-    augment: bool = True,
+    augment: bool = False,  # Disabled by default - SpecAugment hurts performance on small dataset
 ):
     """
     Convenience function to build train/val DataLoaders for Phase 1.
+    NOTE: augment=False by default because SpecAugment reduces performance on this small dataset.
     """
     train_dataset = UrbanSoundDataset(
         csv_path=TRAIN_CSV,
@@ -409,7 +410,7 @@ def create_train_val_dataloaders(
         folds=list(train_folds),
         audio_config=AUDIO_CONFIG,
         cache_dir=cache_dir,
-        augment=augment,  # Enable augmentation for training
+        augment=augment,  # Disabled by default
     )
     val_dataset = UrbanSoundDataset(
         csv_path=TRAIN_CSV,
@@ -642,27 +643,31 @@ def resnet_small_audio(num_classes=NUM_CLASSES):
 class AudioResNetLight(nn.Module):
     """
     Lighter ResNet specifically designed for audio mel spectrograms.
-    Less aggressive downsampling, fewer parameters, better suited for this task.
+    Designed to be similar in complexity to the simple CNN that achieves 82%.
+    Key changes:
+    - Fewer channels (same as simple CNN: 32->64->128->256)
+    - Only one residual block per layer
+    - Lower dropout (0.3 instead of 0.5)
     """
     
     def __init__(self, num_classes=NUM_CLASSES):
         super(AudioResNetLight, self).__init__()
         
-        # Initial feature extraction (no aggressive downsampling)
+        # Initial feature extraction (same as simple CNN)
         self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(32)
         self.relu = nn.ReLU(inplace=True)
         
-        # Residual blocks with gradual downsampling
+        # Residual blocks - matching simple CNN channel sizes
         self.layer1 = self._make_layer(32, 64, stride=2)   # 128 -> 64
         self.layer2 = self._make_layer(64, 128, stride=2)  # 64 -> 32
         self.layer3 = self._make_layer(128, 256, stride=2) # 32 -> 16
-        self.layer4 = self._make_layer(256, 512, stride=2) # 16 -> 8
+        # Removed layer4 to reduce complexity
         
-        # Global pooling and classifier
+        # Global pooling and classifier (same as simple CNN)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.dropout = nn.Dropout(0.5)
-        self.fc = nn.Linear(512, num_classes)
+        self.dropout = nn.Dropout(0.3)  # Reduced from 0.5
+        self.fc = nn.Linear(256, num_classes)  # 256 instead of 512
         
         self._initialize_weights()
     
@@ -699,7 +704,7 @@ class AudioResNetLight(nn.Module):
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
-        x = self.layer4(x)
+        # Removed layer4 to match simple CNN complexity
         
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
@@ -710,7 +715,7 @@ class AudioResNetLight(nn.Module):
 
 
 def resnet_light_audio(num_classes=NUM_CLASSES):
-    """Light ResNet designed for audio - recommended for this task"""
+    """Light ResNet designed for audio - similar complexity to simple CNN"""
     return AudioResNetLight(num_classes=num_classes)
 
 
@@ -809,29 +814,33 @@ def train_model(
     val_loader,
     num_epochs=30,  # Reduced from 50 to prevent overfitting
     learning_rate=1e-3,
-    weight_decay=5e-4,  # Increased weight decay for better regularization
+    weight_decay=1e-4,  # Same as simple CNN
     device=DEVICE,
     save_path="best_resnet_model.pth",
     use_mixup=False,  # Disabled by default for small dataset
-    label_smoothing=0.05,  # Reduced from 0.1
+    label_smoothing=0.0,  # Disabled - use regular CrossEntropyLoss like simple CNN
 ):
     """
     Full training loop with validation and model saving.
-    NOTE: More conservative settings for smaller dataset:
-    - Disabled mixup by default
-    - Reduced label smoothing
-    - Using ReduceLROnPlateau instead of CosineAnnealing
-    - Increased weight decay
+    NOTE: Simplified to match simple CNN settings:
+    - No mixup
+    - No label smoothing (use regular CrossEntropyLoss)
+    - No SpecAugment
+    - Same optimizer settings as simple CNN
     """
     model = model.to(device)
     
-    # Use label smoothing for training, regular CE for validation
-    train_criterion = LabelSmoothingCrossEntropy(smoothing=label_smoothing)
+    # Use regular CrossEntropyLoss like the simple CNN (no label smoothing)
+    if label_smoothing > 0:
+        train_criterion = LabelSmoothingCrossEntropy(smoothing=label_smoothing)
+    else:
+        train_criterion = nn.CrossEntropyLoss()
     val_criterion = nn.CrossEntropyLoss()
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    # Use Adam like simple CNN (not AdamW)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     
-    # Use ReduceLROnPlateau for more stable training (like the simple CNN)
+    # Use ReduceLROnPlateau for more stable training (same as simple CNN)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6, verbose=True
     )
@@ -985,7 +994,7 @@ def run_training(
     if cache_dir is None:
         cache_dir = BASE_DIR / "mel_cache"
 
-    # Create data loaders with augmentation
+    # Create data loaders WITHOUT augmentation (SpecAugment hurts on small dataset)
     print("\nCreating data loaders...")
     train_loader, val_loader = create_train_val_dataloaders(
         train_folds=train_folds,
@@ -993,7 +1002,7 @@ def run_training(
         batch_size=batch_size,
         num_workers=0,
         cache_dir=cache_dir,
-        augment=True,  # Enable SpecAugment for training
+        augment=False,  # Disabled - SpecAugment hurts performance
     )
 
     # Create model
@@ -1008,7 +1017,7 @@ def run_training(
     print(f"\nTotal parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
 
-    # Train with conservative settings for small dataset
+    # Train with same settings as simple CNN
     history = train_model(
         model=model,
         train_loader=train_loader,
@@ -1018,8 +1027,8 @@ def run_training(
         weight_decay=weight_decay,
         device=DEVICE,
         save_path="best_resnet_model.pth",
-        use_mixup=False,  # Disabled for small dataset
-        label_smoothing=0.05,  # Reduced
+        use_mixup=False,  # Same as simple CNN
+        label_smoothing=0.0,  # Same as simple CNN (no smoothing)
     )
 
     return model, history
@@ -1152,7 +1161,7 @@ def run_cv_ensemble(
         # Create fresh model
         model = create_model(model_type)
         
-        # Train with conservative settings
+        # Train with same settings as simple CNN
         save_path = f"model_fold{val_fold}.pth"
         history = train_model(
             model=model,
@@ -1160,11 +1169,11 @@ def run_cv_ensemble(
             val_loader=val_loader,
             num_epochs=num_epochs,
             learning_rate=learning_rate,
-            weight_decay=5e-4,  # Increased
+            weight_decay=1e-4,  # Same as simple CNN
             device=DEVICE,
             save_path=save_path,
-            use_mixup=False,  # Disabled
-            label_smoothing=0.05,  # Reduced
+            use_mixup=False,  # Same as simple CNN
+            label_smoothing=0.0,  # Same as simple CNN
         )
         
         # Load best model
@@ -1264,15 +1273,15 @@ if __name__ == "__main__":
     set_seed(SEED)
     
     # Option 1: Single model training (faster, ~15-20 min)
-    # 使用更轻量的 resnet_small，减少过拟合
-    # 关闭 Mixup，降低 Label Smoothing 和 SpecAugment 强度
-    # 减少 epoch 从 50 到 30，防止过拟合
-    run_full_pipeline(model_type="resnet_small", num_epochs=30)
+    # 使用更轻量的 resnet_light，结构更接近简单 CNN
+    # 关闭所有高级技术（Mixup, Label Smoothing, SpecAugment）
+    # 使用与简单 CNN 完全相同的训练设置
+    run_full_pipeline(model_type="resnet_light", num_epochs=30)
     
     # Option 2: Cross-validation ensemble (slower but better, ~2-3 hours)
     # 训练8个模型并平均预测，通常提升2-5%
     # run_cv_ensemble(
-    #     model_type="resnet_small",  # 使用更小的模型
+    #     model_type="resnet_light",  # 使用更接近简单 CNN 的模型
     #     num_epochs=25,  # 减少 epoch
     #     batch_size=32,
     #     learning_rate=1e-3,
