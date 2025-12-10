@@ -9,6 +9,7 @@ import os
 import zipfile
 import random
 from pathlib import Path
+import matplotlib.pyplot as plt
 
 import librosa
 import numpy as np
@@ -456,6 +457,65 @@ def create_test_dataloader(batch_size=32, num_workers=0, cache_dir: Path | None 
     return test_loader
 
 
+def compute_class_weights(folds, csv_path: Path = TRAIN_CSV):
+    """
+    根据指定的 folds 计算类别权重，缓解类别不平衡。
+    返回 torch.float32 张量，顺序按 classID 0..NUM_CLASSES-1。
+    """
+    df = pd.read_csv(csv_path)
+    df = df[df["fold"].isin(folds)]
+    counts = df["classID"].value_counts().sort_index()
+    # 防止除零，添加很小的平滑
+    class_counts = counts.reindex(range(NUM_CLASSES)).fillna(0) + 1e-6
+    weights = class_counts.sum() / (NUM_CLASSES * class_counts)
+    return torch.tensor(weights.values, dtype=torch.float32)
+
+
+def get_class_names(csv_path: Path = TRAIN_CSV):
+    """
+    返回按 classID 排序的类别名称列表；若未找到名称，则退化为字符串化的 ID。
+    """
+    df = pd.read_csv(csv_path)
+    name_by_id = df.drop_duplicates("classID").set_index("classID")["class"]
+    class_names = []
+    for i in range(NUM_CLASSES):
+        if i in name_by_id.index:
+            class_names.append(str(name_by_id.loc[i]))
+        else:
+            class_names.append(str(i))
+    return class_names
+
+
+def plot_confusion_matrix(targets, preds, class_names, normalize=True, save_path="confusion_matrix.png"):
+    """
+    绘制并保存混淆矩阵。
+    """
+    cm = confusion_matrix(targets, preds, labels=list(range(len(class_names))))
+    if normalize:
+        cm = cm.astype(np.float32) / (cm.sum(axis=1, keepdims=True) + 1e-8)
+
+    plt.figure(figsize=(8, 6))
+    im = plt.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
+    plt.title("Confusion Matrix")
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+    tick_marks = np.arange(len(class_names))
+    plt.xticks(tick_marks, class_names, rotation=45, ha="right")
+    plt.yticks(tick_marks, class_names)
+    fmt = ".2f" if normalize else "d"
+    thresh = cm.max() * 0.6
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, format(cm[i, j], fmt),
+                     ha="center", va="center",
+                     color="white" if cm[i, j] > thresh else "black")
+    plt.ylabel("True label")
+    plt.xlabel("Predicted label")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"Confusion matrix saved to {save_path}")
+
+
 class BasicBlock(nn.Module):
     """
     Basic residual block for ResNet-18/34
@@ -819,6 +879,9 @@ def train_model(
     save_path="best_resnet_model.pth",
     use_mixup=False,  # Disabled by default for small dataset
     label_smoothing=0.0,  # Disabled - use regular CrossEntropyLoss like simple CNN
+    class_weights=None,
+    confusion_save_path=None,
+    class_names=None,
 ):
     """
     Full training loop with validation and model saving.
@@ -830,12 +893,14 @@ def train_model(
     """
     model = model.to(device)
     
+    weight_tensor = class_weights.to(device) if class_weights is not None else None
+
     # Use regular CrossEntropyLoss like the simple CNN (no label smoothing)
     if label_smoothing > 0:
         train_criterion = LabelSmoothingCrossEntropy(smoothing=label_smoothing)
     else:
-        train_criterion = nn.CrossEntropyLoss()
-    val_criterion = nn.CrossEntropyLoss()
+        train_criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+    val_criterion = nn.CrossEntropyLoss(weight=weight_tensor)
     
     # Use Adam like simple CNN (not AdamW)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -855,6 +920,8 @@ def train_model(
     print(f"Train samples: {len(train_loader.dataset)}")
     print(f"Val samples: {len(val_loader.dataset)}")
     print(f"Using mixup: {use_mixup}, Label smoothing: {label_smoothing}")
+    if class_weights is not None:
+        print(f"Using class weights to handle imbalance: {class_weights.cpu().numpy()}")
     print("=" * 60)
 
     for epoch in range(num_epochs):
@@ -897,6 +964,14 @@ def train_model(
     print("\n" + "=" * 60)
     print(f"Training complete! Best score: {best_score:.4f}")
     print(f"Model saved to: {save_path}")
+
+    # 额外一步：用最佳模型在验证集上绘制混淆矩阵
+    if confusion_save_path is not None:
+        if save_path and Path(save_path).exists():
+            model.load_state_dict(torch.load(save_path, map_location=device))
+        _, _, _, _, preds, targets = evaluate(model, val_loader, val_criterion, device)
+        cm_class_names = class_names or [str(i) for i in range(NUM_CLASSES)]
+        plot_confusion_matrix(targets, preds, cm_class_names, normalize=True, save_path=confusion_save_path)
 
     return history
 
@@ -1017,6 +1092,10 @@ def run_training(
     print(f"\nTotal parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
 
+    # 类别权重（针对训练 folds）
+    class_weights = compute_class_weights(train_folds)
+    class_names = get_class_names()
+
     # Train with same settings as simple CNN
     history = train_model(
         model=model,
@@ -1029,6 +1108,9 @@ def run_training(
         save_path="best_resnet_model.pth",
         use_mixup=False,  # Same as simple CNN
         label_smoothing=0.0,  # Same as simple CNN (no smoothing)
+        class_weights=class_weights,
+        confusion_save_path="confmat_val.png",
+        class_names=class_names,
     )
 
     return model, history
@@ -1136,6 +1218,7 @@ def run_cv_ensemble(
     
     cache_dir = BASE_DIR / "mel_cache"
     all_folds = list(range(1, n_folds + 1))
+    class_names = get_class_names()
     
     # Store models for ensemble
     models = []
@@ -1147,6 +1230,7 @@ def run_cv_ensemble(
         print("=" * 60)
         
         train_folds = [f for f in all_folds if f != val_fold]
+        class_weights = compute_class_weights(train_folds)
         
         # Create data loaders
         train_loader, val_loader = create_train_val_dataloaders(
@@ -1174,6 +1258,9 @@ def run_cv_ensemble(
             save_path=save_path,
             use_mixup=False,  # Same as simple CNN
             label_smoothing=0.0,  # Same as simple CNN
+            class_weights=class_weights,
+            confusion_save_path=f"confmat_fold{val_fold}.png",
+            class_names=class_names,
         )
         
         # Load best model
