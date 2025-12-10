@@ -20,6 +20,32 @@ from torch.utils.data import DataLoader, Dataset
 from sklearn.metrics import f1_score, confusion_matrix
 from tqdm import tqdm
 
+
+# =============================================================================
+# Reproducibility - Set Random Seeds
+# =============================================================================
+
+def set_seed(seed=42):
+    """
+    Set random seeds for reproducibility.
+    Call this at the beginning of training.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # for multi-GPU
+    # Make CUDA deterministic (may slow down training slightly)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    print(f"Random seed set to: {seed}")
+
+
+# Set seed at import time for consistency
+SEED = 42
+set_seed(SEED)
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -68,9 +94,10 @@ class SpecAugment:
     """
     SpecAugment: A Simple Data Augmentation Method for ASR
     Applies time and frequency masking to spectrograms.
+    NOTE: Reduced parameters to prevent over-regularization on small dataset.
     """
-    def __init__(self, freq_mask_param=20, time_mask_param=40, 
-                 num_freq_masks=2, num_time_masks=2):
+    def __init__(self, freq_mask_param=10, time_mask_param=20, 
+                 num_freq_masks=1, num_time_masks=1):
         self.freq_mask_param = freq_mask_param
         self.time_mask_param = time_mask_param
         self.num_freq_masks = num_freq_masks
@@ -104,12 +131,15 @@ class SpecAugment:
         return augmented.squeeze(0) if len(mel_spec.shape) == 2 else augmented
 
 
-def mixup_data(x, y, alpha=0.4):
+def mixup_data(x, y, alpha=0.2):
     """
     Mixup augmentation: creates virtual training examples.
+    NOTE: Reduced alpha from 0.4 to 0.2 for smaller dataset.
     """
     if alpha > 0:
         lam = np.random.beta(alpha, alpha)
+        # Ensure lam is not too extreme (keep more of original sample)
+        lam = max(lam, 1 - lam)
     else:
         lam = 1
 
@@ -129,8 +159,9 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 class LabelSmoothingCrossEntropy(nn.Module):
     """
     Cross entropy loss with label smoothing.
+    NOTE: Reduced default smoothing from 0.1 to 0.05 for smaller dataset.
     """
-    def __init__(self, smoothing=0.1):
+    def __init__(self, smoothing=0.05):
         super().__init__()
         self.smoothing = smoothing
     
@@ -254,13 +285,13 @@ class UrbanSoundDataset(Dataset):
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         
-        # Augmentation
+        # Augmentation - reduced intensity to prevent over-regularization
         self.augment = augment
         self.spec_augment = SpecAugment(
-            freq_mask_param=15,
-            time_mask_param=35,
-            num_freq_masks=2,
-            num_time_masks=2
+            freq_mask_param=8,
+            time_mask_param=15,
+            num_freq_masks=1,
+            num_time_masks=1
         ) if augment else None
 
     def __len__(self):
@@ -687,9 +718,11 @@ def resnet_light_audio(num_classes=NUM_CLASSES):
 # Training & Evaluation Functions
 # =============================================================================
 
-def train_one_epoch(model, train_loader, criterion, optimizer, device, use_mixup=True, mixup_alpha=0.4):
+def train_one_epoch(model, train_loader, criterion, optimizer, device, use_mixup=False, mixup_alpha=0.2):
     """
     Train for one epoch with optional mixup augmentation.
+    NOTE: Mixup disabled by default - can be enabled for larger datasets.
+    Reduced mixup_alpha and probability for smaller dataset.
     """
     model.train()
     running_loss = 0.0
@@ -702,8 +735,8 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device, use_mixup
 
         optimizer.zero_grad()
         
-        # Apply mixup with some probability
-        if use_mixup and random.random() > 0.5:
+        # Apply mixup with lower probability (30% instead of 50%)
+        if use_mixup and random.random() > 0.7:
             inputs, targets_a, targets_b, lam = mixup_data(inputs, targets, mixup_alpha)
             outputs = model(inputs)
             loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
@@ -774,17 +807,21 @@ def train_model(
     model,
     train_loader,
     val_loader,
-    num_epochs=50,
+    num_epochs=30,  # Reduced from 50 to prevent overfitting
     learning_rate=1e-3,
-    weight_decay=1e-4,
+    weight_decay=5e-4,  # Increased weight decay for better regularization
     device=DEVICE,
     save_path="best_resnet_model.pth",
-    use_mixup=True,
-    label_smoothing=0.1,
+    use_mixup=False,  # Disabled by default for small dataset
+    label_smoothing=0.05,  # Reduced from 0.1
 ):
     """
     Full training loop with validation and model saving.
-    Includes label smoothing and mixup augmentation.
+    NOTE: More conservative settings for smaller dataset:
+    - Disabled mixup by default
+    - Reduced label smoothing
+    - Using ReduceLROnPlateau instead of CosineAnnealing
+    - Increased weight decay
     """
     model = model.to(device)
     
@@ -794,9 +831,9 @@ def train_model(
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     
-    # Cosine annealing with warm restarts for better convergence
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=10, T_mult=2, eta_min=1e-6
+    # Use ReduceLROnPlateau for more stable training (like the simple CNN)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6, verbose=True
     )
 
     best_score = 0.0
@@ -826,8 +863,8 @@ def train_model(
             model, val_loader, val_criterion, device
         )
 
-        # Update scheduler
-        scheduler.step()
+        # Update scheduler with validation score (for ReduceLROnPlateau)
+        scheduler.step(val_score)
 
         # Save history
         history['train_loss'].append(train_loss)
@@ -971,7 +1008,7 @@ def run_training(
     print(f"\nTotal parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
 
-    # Train with mixup and label smoothing
+    # Train with conservative settings for small dataset
     history = train_model(
         model=model,
         train_loader=train_loader,
@@ -981,8 +1018,8 @@ def run_training(
         weight_decay=weight_decay,
         device=DEVICE,
         save_path="best_resnet_model.pth",
-        use_mixup=True,
-        label_smoothing=0.1,
+        use_mixup=False,  # Disabled for small dataset
+        label_smoothing=0.05,  # Reduced
     )
 
     return model, history
@@ -1115,7 +1152,7 @@ def run_cv_ensemble(
         # Create fresh model
         model = create_model(model_type)
         
-        # Train
+        # Train with conservative settings
         save_path = f"model_fold{val_fold}.pth"
         history = train_model(
             model=model,
@@ -1123,11 +1160,11 @@ def run_cv_ensemble(
             val_loader=val_loader,
             num_epochs=num_epochs,
             learning_rate=learning_rate,
-            weight_decay=1e-4,
+            weight_decay=5e-4,  # Increased
             device=DEVICE,
             save_path=save_path,
-            use_mixup=True,
-            label_smoothing=0.1,
+            use_mixup=False,  # Disabled
+            label_smoothing=0.05,  # Reduced
         )
         
         # Load best model
@@ -1223,15 +1260,20 @@ def run_full_pipeline(model_type="resnet18", num_epochs=50):
 
 
 if __name__ == "__main__":
-    # Option 1: Single model training (faster, ~30 min)
-    # 包含 SpecAugment + Mixup + Label Smoothing
-    run_full_pipeline(model_type="resnet_light", num_epochs=50)
+    # Set seed for reproducibility
+    set_seed(SEED)
     
-    # Option 2: Cross-validation ensemble (slower but better, ~4 hours)
+    # Option 1: Single model training (faster, ~15-20 min)
+    # 使用更轻量的 resnet_small，减少过拟合
+    # 关闭 Mixup，降低 Label Smoothing 和 SpecAugment 强度
+    # 减少 epoch 从 50 到 30，防止过拟合
+    run_full_pipeline(model_type="resnet_small", num_epochs=30)
+    
+    # Option 2: Cross-validation ensemble (slower but better, ~2-3 hours)
     # 训练8个模型并平均预测，通常提升2-5%
     # run_cv_ensemble(
-    #     model_type="resnet_light",
-    #     num_epochs=40,
+    #     model_type="resnet_small",  # 使用更小的模型
+    #     num_epochs=25,  # 减少 epoch
     #     batch_size=32,
     #     learning_rate=1e-3,
     #     n_folds=8,
