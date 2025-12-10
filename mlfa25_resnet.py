@@ -1223,17 +1223,18 @@ def run_full_pipeline(model_type="resnet18", num_epochs=50):
 
 
 if __name__ == "__main__":
-    # Option 1: Single model training (faster, for testing)
-    # run_full_pipeline(model_type="resnet_light", num_epochs=30)
+    # Option 1: Single model training (faster, ~30 min)
+    # 包含 SpecAugment + Mixup + Label Smoothing
+    run_full_pipeline(model_type="resnet_light", num_epochs=50)
     
-    # Option 2: Cross-validation ensemble (better performance, recommended)
-    # This trains 8 models and averages their predictions
-    run_cv_ensemble(
-        model_type="resnet_light",
-        num_epochs=40,
-        batch_size=32,
-        learning_rate=1e-3,
-        n_folds=8,
-        output_path="submission.csv",
-    )
+    # Option 2: Cross-validation ensemble (slower but better, ~4 hours)
+    # 训练8个模型并平均预测，通常提升2-5%
+    # run_cv_ensemble(
+    #     model_type="resnet_light",
+    #     num_epochs=40,
+    #     batch_size=32,
+    #     learning_rate=1e-3,
+    #     n_folds=8,
+    #     output_path="submission.csv",
+    # )
 
