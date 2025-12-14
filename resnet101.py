@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Urban Sound Classification with ResNet-18
-Clean implementation inspired by cnn.py
+Urban Sound Classification with ResNet-101
+8-fold Cross-Validation Ensemble
 
 Key features:
-- ResNet-18 architecture (18 layers)
+- ResNet-101 architecture (101 layers with Bottleneck blocks)
 - SE attention blocks
-- SpecAugment + Mixup
+- 3-channel features (Mel + Delta + Delta-Delta)
+- SpecAugment + TimeShift + Mixup
 - Cosine annealing LR
 - Label smoothing
+- 8-fold CV ensemble
 """
 
 import random
@@ -50,42 +52,9 @@ def extract_mel_3ch(audio_path, config=AUDIO_CONFIG):
     """
     Convert audio to 3-channel feature:
     - Channel 0: Log-Mel spectrogram
-    - Channel 1: Delta (1st derivative) 
+    - Channel 1: Delta (1st derivative)
     - Channel 2: Delta-Delta (2nd derivative)
-    
-    Peak normalization: ref=np.max
     """
-    y, _ = librosa.load(str(audio_path), sr=config["sr"])
-    
-    # Pad/truncate to fixed duration
-    target_len = int(config["sr"] * config["duration"])
-    if len(y) > target_len:
-        y = y[:target_len]
-    else:
-        y = np.pad(y, (0, max(0, target_len - len(y))))
-    
-    # Compute mel spectrogram with peak normalization
-    mel = librosa.feature.melspectrogram(
-        y=y, sr=config["sr"], n_mels=config["n_mels"],
-        n_fft=config["n_fft"], hop_length=config["hop_length"], fmax=config["fmax"]
-    )
-    mel_db = librosa.power_to_db(mel, ref=np.max)  # Peak normalization
-    
-    # Compute Delta and Delta-Delta
-    delta = librosa.feature.delta(mel_db)
-    delta2 = librosa.feature.delta(mel_db, order=2)
-    
-    # Normalize each channel to [0, 1]
-    def normalize(x):
-        return ((x - x.min()) / (x.max() - x.min() + 1e-8)).astype(np.float32)
-    
-    # Stack into 3 channels: (3, n_mels, time)
-    features = np.stack([normalize(mel_db), normalize(delta), normalize(delta2)], axis=0)
-    return features
-
-
-def extract_mel_1ch(audio_path, config=AUDIO_CONFIG):
-    """Single channel version for comparison."""
     y, _ = librosa.load(str(audio_path), sr=config["sr"])
     
     target_len = int(config["sr"] * config["duration"])
@@ -99,15 +68,22 @@ def extract_mel_1ch(audio_path, config=AUDIO_CONFIG):
         n_fft=config["n_fft"], hop_length=config["hop_length"], fmax=config["fmax"]
     )
     mel_db = librosa.power_to_db(mel, ref=np.max)
-    mel_db = (mel_db - mel_db.min()) / (mel_db.max() - mel_db.min() + 1e-8)
-    return mel_db.astype(np.float32)
+    
+    delta = librosa.feature.delta(mel_db)
+    delta2 = librosa.feature.delta(mel_db, order=2)
+    
+    def normalize(x):
+        return ((x - x.min()) / (x.max() - x.min() + 1e-8)).astype(np.float32)
+    
+    features = np.stack([normalize(mel_db), normalize(delta), normalize(delta2)], axis=0)
+    return features
 
 # =============================================================================
 # Data Augmentation
 # =============================================================================
 
 class SpecAugment:
-    """Time and frequency masking for spectrograms (supports multi-channel)."""
+    """Time and frequency masking."""
     def __init__(self, freq_mask=15, time_mask=25, n_freq=2, n_time=2):
         self.freq_mask = freq_mask
         self.time_mask = time_mask
@@ -115,13 +91,11 @@ class SpecAugment:
         self.n_time = n_time
     
     def __call__(self, x):
-        # x: (C, H, W) or (H, W)
         if x.dim() == 2:
             x = x.unsqueeze(0)
         c, n_mels, time_steps = x.shape
         out = x.clone()
         
-        # Apply same mask to all channels
         for _ in range(self.n_freq):
             f = random.randint(0, min(self.freq_mask, n_mels - 1))
             f0 = random.randint(0, n_mels - f)
@@ -136,58 +110,51 @@ class SpecAugment:
 
 
 class TimeShift:
-    """Random time shift augmentation."""
-    def __init__(self, max_shift=0.2):
-        self.max_shift = max_shift  # Fraction of total time
+    """Random time shift."""
+    def __init__(self, max_shift=0.1):
+        self.max_shift = max_shift
     
     def __call__(self, x):
-        # x: (C, H, W) or (H, W)
         if x.dim() == 2:
             x = x.unsqueeze(0)
-        
         _, _, time_steps = x.shape
         shift = int(time_steps * self.max_shift * (random.random() * 2 - 1))
         return torch.roll(x, shifts=shift, dims=-1)
 
 
 class AudioAugment:
-    """Combined augmentation: SpecAugment + TimeShift."""
+    """Combined augmentation."""
     def __init__(self):
         self.spec_aug = SpecAugment(freq_mask=15, time_mask=25, n_freq=2, n_time=2)
         self.time_shift = TimeShift(max_shift=0.1)
     
     def __call__(self, x):
-        # Apply time shift (30% chance)
         if random.random() < 0.3:
             x = self.time_shift(x)
-        # Apply spec augment (50% chance)
         if random.random() < 0.5:
             x = self.spec_aug(x)
         return x
 
 
 def mixup(x, y, alpha=0.2):
-    """Mixup data augmentation."""
+    """Mixup augmentation."""
     if alpha > 0:
         lam = np.random.beta(alpha, alpha)
         lam = max(lam, 1 - lam)
     else:
         lam = 1
-    
     idx = torch.randperm(x.size(0)).to(x.device)
     mixed_x = lam * x + (1 - lam) * x[idx]
-    y_a, y_b = y, y[idx]
-    return mixed_x, y_a, y_b, lam
+    return mixed_x, y, y[idx], lam
 
 # =============================================================================
-# Dataset (3-channel support)
+# Dataset
 # =============================================================================
 
 class AudioDataset(Dataset):
-    """Dataset with 3-channel features and augmentation."""
+    """Dataset with 3-channel features."""
     
-    def __init__(self, csv_path, audio_dir, folds=None, cache_dir=None, 
-                 augment=False, use_3ch=True):
+    def __init__(self, csv_path, audio_dir, folds=None, cache_dir=None, augment=False):
         self.audio_dir = Path(audio_dir)
         self.df = pd.read_csv(csv_path)
         if folds:
@@ -198,7 +165,6 @@ class AudioDataset(Dataset):
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         
         self.augment = augment
-        self.use_3ch = use_3ch
         self.aug = AudioAugment() if augment else None
     
     def __len__(self):
@@ -208,26 +174,16 @@ class AudioDataset(Dataset):
         row = self.df.iloc[idx]
         fold, fname, label = row["fold"], row["slice_file_name"], int(row["classID"])
         
-        # Cache path (different for 1ch vs 3ch)
-        suffix = "_3ch" if self.use_3ch else "_1ch"
-        cache = self.cache_dir / f"fold{fold}_{Path(fname).stem}{suffix}.npy" if self.cache_dir else None
+        cache = self.cache_dir / f"fold{fold}_{Path(fname).stem}_3ch.npy" if self.cache_dir else None
         
         if cache and cache.exists():
             features = np.load(cache)
         else:
-            audio_path = self.audio_dir / f"fold{fold}" / fname
-            if self.use_3ch:
-                features = extract_mel_3ch(audio_path)  # (3, H, W)
-            else:
-                features = extract_mel_1ch(audio_path)  # (H, W)
+            features = extract_mel_3ch(self.audio_dir / f"fold{fold}" / fname)
             if cache:
                 np.save(cache, features)
         
         x = torch.from_numpy(features)
-        if not self.use_3ch:
-            x = x.unsqueeze(0)  # (1, H, W)
-        
-        # Apply augmentation
         if self.augment and self.aug:
             x = self.aug(x)
         
@@ -235,42 +191,33 @@ class AudioDataset(Dataset):
 
 
 class TestDataset(Dataset):
-    """Test dataset with 3-channel support."""
+    """Test dataset."""
     
-    def __init__(self, csv_path, audio_dir, cache_dir=None, use_3ch=True):
+    def __init__(self, csv_path, audio_dir, cache_dir=None):
         self.audio_dir = Path(audio_dir)
         self.df = pd.read_csv(csv_path)
         self.cache_dir = Path(cache_dir) if cache_dir else None
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.use_3ch = use_3ch
     
     def __len__(self):
         return len(self.df)
     
     def __getitem__(self, idx):
         fname = self.df.iloc[idx]["slice_file_name"]
-        suffix = "_3ch" if self.use_3ch else "_1ch"
-        cache = self.cache_dir / f"test_{Path(fname).stem}{suffix}.npy" if self.cache_dir else None
+        cache = self.cache_dir / f"test_{Path(fname).stem}_3ch.npy" if self.cache_dir else None
         
         if cache and cache.exists():
             features = np.load(cache)
         else:
-            if self.use_3ch:
-                features = extract_mel_3ch(self.audio_dir / fname)
-            else:
-                features = extract_mel_1ch(self.audio_dir / fname)
+            features = extract_mel_3ch(self.audio_dir / fname)
             if cache:
                 np.save(cache, features)
         
-        x = torch.from_numpy(features)
-        if not self.use_3ch:
-            x = x.unsqueeze(0)
-        
-        return x, fname
+        return torch.from_numpy(features), fname
 
 # =============================================================================
-# ResNet-18 Model
+# ResNet-101 Model (Bottleneck blocks)
 # =============================================================================
 
 class SEBlock(nn.Module):
@@ -292,72 +239,95 @@ class SEBlock(nn.Module):
         return x * y
 
 
-class BasicBlock(nn.Module):
-    """ResNet basic block with optional SE attention."""
+class Bottleneck(nn.Module):
+    """
+    Bottleneck block for ResNet-50/101/152.
+    1x1 conv (reduce) -> 3x3 conv -> 1x1 conv (expand)
+    Expansion factor = 4
+    """
+    expansion = 4
     
-    def __init__(self, in_ch, out_ch, stride=1, use_se=False):
+    def __init__(self, in_ch, out_ch, stride=1, downsample=None, use_se=False):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
+        # 1x1 conv (reduce channels)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(out_ch)
-        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1, bias=False)
+        
+        # 3x3 conv
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, stride=stride, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_ch)
         
-        self.se = SEBlock(out_ch) if use_se else nn.Identity()
+        # 1x1 conv (expand channels)
+        self.conv3 = nn.Conv2d(out_ch, out_ch * self.expansion, 1, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_ch * self.expansion)
         
-        # Shortcut for dimension mismatch
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_ch != out_ch:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_ch)
-            )
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.se = SEBlock(out_ch * self.expansion) if use_se else nn.Identity()
     
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
+        identity = x
+        
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.relu(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
         out = self.se(out)
-        out += self.shortcut(x)
-        return F.relu(out)
+        
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        
+        out += identity
+        return self.relu(out)
 
 
-class ResNet18(nn.Module):
+class ResNet101(nn.Module):
     """
-    ResNet-18 for audio classification.
+    ResNet-101 for audio classification.
     
-    Architecture: [2, 2, 2, 2] blocks = 18 layers
-    Channels: 64 -> 128 -> 256 -> 512
-    
-    Modifications for audio:
-    - Supports 1 or 3 input channels (Mel / Mel+Delta+Delta2)
-    - 3x3 initial conv (not 7x7)
-    - No initial maxpool
-    - SE attention in later layers
+    Architecture: [3, 4, 23, 3] Bottleneck blocks = 101 layers
+    - conv1: 1 layer
+    - layer1: 3 * 3 = 9 layers
+    - layer2: 4 * 3 = 12 layers
+    - layer3: 23 * 3 = 69 layers
+    - layer4: 3 * 3 = 9 layers
+    - fc: 1 layer
+    - Total: 1 + 9 + 12 + 69 + 9 + 1 = 101 layers
     """
     
     def __init__(self, in_channels=3, num_classes=NUM_CLASSES, use_se=True):
         super().__init__()
         
-        # Initial conv (supports 1 or 3 channels)
-        self.conv1 = nn.Conv2d(in_channels, 64, 3, stride=1, padding=1, bias=False)
+        # Initial conv
+        self.conv1 = nn.Conv2d(in_channels, 64, 7, stride=2, padding=3, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(3, stride=2, padding=1)
         
-        # Residual layers: [2, 2, 2, 2] blocks
-        self.layer1 = self._make_layer(64, 64, 2, stride=1, use_se=False)
-        self.layer2 = self._make_layer(64, 128, 2, stride=2, use_se=use_se)
-        self.layer3 = self._make_layer(128, 256, 2, stride=2, use_se=use_se)
-        self.layer4 = self._make_layer(256, 512, 2, stride=2, use_se=use_se)
+        # ResNet-101: [3, 4, 23, 3] Bottleneck blocks
+        self.layer1 = self._make_layer(64, 64, 3, stride=1, use_se=False)
+        self.layer2 = self._make_layer(256, 128, 4, stride=2, use_se=use_se)
+        self.layer3 = self._make_layer(512, 256, 23, stride=2, use_se=use_se)
+        self.layer4 = self._make_layer(1024, 512, 3, stride=2, use_se=use_se)
         
         # Classifier
         self.avgpool = nn.AdaptiveAvgPool2d(1)
         self.dropout = nn.Dropout(0.4)
-        self.fc = nn.Linear(512, num_classes)
+        self.fc = nn.Linear(512 * Bottleneck.expansion, num_classes)
         
         self._init_weights()
     
     def _make_layer(self, in_ch, out_ch, num_blocks, stride, use_se):
-        layers = [BasicBlock(in_ch, out_ch, stride, use_se)]
+        downsample = None
+        if stride != 1 or in_ch != out_ch * Bottleneck.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch * Bottleneck.expansion, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_ch * Bottleneck.expansion)
+            )
+        
+        layers = [Bottleneck(in_ch, out_ch, stride, downsample, use_se)]
         for _ in range(1, num_blocks):
-            layers.append(BasicBlock(out_ch, out_ch, 1, use_se))
+            layers.append(Bottleneck(out_ch * Bottleneck.expansion, out_ch, use_se=use_se))
+        
         return nn.Sequential(*layers)
     
     def _init_weights(self):
@@ -369,7 +339,8 @@ class ResNet18(nn.Module):
                 nn.init.constant_(m.bias, 0)
     
     def forward(self, x):
-        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.maxpool(x)
         
         x = self.layer1(x)
         x = self.layer2(x)
@@ -387,14 +358,13 @@ class ResNet18(nn.Module):
 # =============================================================================
 
 def train_epoch(model, loader, criterion, optimizer, device, use_mixup=True):
-    """Train one epoch with optional mixup."""
+    """Train one epoch."""
     model.train()
     total_loss, correct, total = 0, 0, 0
     
     for x, y in tqdm(loader, desc="Training"):
         x, y = x.to(device), y.to(device)
         
-        # Mixup
         if use_mixup and random.random() > 0.5:
             x, y_a, y_b, lam = mixup(x, y)
             out = model(x)
@@ -440,19 +410,15 @@ def evaluate(model, loader, criterion, device):
     return total_loss / total, acc, f1, score
 
 
-def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3, 
-                label_smoothing=0.1, use_mixup=True, save_path="resnet18_best.pth"):
-    """Full training loop."""
+def train_model(model, train_loader, val_loader, epochs=60, lr=1e-3,
+                label_smoothing=0.1, use_mixup=True, save_path="resnet101_best.pth"):
+    """Training loop."""
     model = model.to(DEVICE)
     
-    # Loss with label smoothing
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
     val_criterion = nn.CrossEntropyLoss()
     
-    # AdamW optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    
-    # Cosine annealing scheduler
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     
     best_score = 0
@@ -465,12 +431,8 @@ def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3,
         lr_now = optimizer.param_groups[0]['lr']
         print(f"\nEpoch {epoch+1}/{epochs} (lr={lr_now:.6f})")
         
-        train_loss, train_acc = train_epoch(
-            model, train_loader, criterion, optimizer, DEVICE, use_mixup
-        )
-        val_loss, val_acc, val_f1, val_score = evaluate(
-            model, val_loader, val_criterion, DEVICE
-        )
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, DEVICE, use_mixup)
+        val_loss, val_acc, val_f1, val_score = evaluate(model, val_loader, val_criterion, DEVICE)
         
         scheduler.step()
         
@@ -489,20 +451,7 @@ def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3,
 # Inference
 # =============================================================================
 
-def predict(model, loader):
-    """Generate predictions."""
-    model.eval()
-    results = []
-    
-    with torch.no_grad():
-        for x, fnames in tqdm(loader, desc="Predicting"):
-            preds = model(x.to(DEVICE)).argmax(1).cpu().numpy()
-            results.extend(zip(fnames, preds))
-    
-    return results
-
-
-def save_submission(predictions, path="resnet18.csv"):
+def save_submission(predictions, path="resnet101.csv"):
     """Save predictions to CSV."""
     df = pd.DataFrame({
         "ID": range(len(predictions)),
@@ -516,75 +465,10 @@ def save_submission(predictions, path="resnet18.csv"):
     return df
 
 # =============================================================================
-# Main Pipeline
+# 8-Fold Cross-Validation Ensemble
 # =============================================================================
 
-def run(
-    train_folds=(1, 2, 3, 4, 5, 6),
-    val_folds=(7, 8),
-    batch_size=32,
-    epochs=50,
-    lr=1e-3,
-    num_workers=4,
-    use_se=True,
-    use_mixup=True,
-    label_smoothing=0.1,
-    use_3ch=True,  # 3-channel features (Mel + Delta + Delta2)
-):
-    """Run complete pipeline: train + inference."""
-    
-    if not TRAIN_CSV.exists():
-        print(f"Error: {TRAIN_CSV} not found")
-        return
-    
-    in_channels = 3 if use_3ch else 1
-    
-    print("=" * 60)
-    print("ResNet-18 Audio Classification")
-    print("=" * 60)
-    print(f"Train folds: {train_folds}")
-    print(f"Val folds: {val_folds}")
-    print(f"Features: {in_channels}-channel {'(Mel+Delta+Delta2)' if use_3ch else '(Mel only)'}")
-    print(f"SE attention: {use_se}")
-    print(f"Mixup: {use_mixup} | Label smoothing: {label_smoothing}")
-    
-    # Data loaders
-    train_loader = DataLoader(
-        AudioDataset(TRAIN_CSV, AUDIO_DIR, list(train_folds), CACHE_DIR, 
-                     augment=True, use_3ch=use_3ch),
-        batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True
-    )
-    val_loader = DataLoader(
-        AudioDataset(TRAIN_CSV, AUDIO_DIR, list(val_folds), CACHE_DIR, 
-                     augment=False, use_3ch=use_3ch),
-        batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True
-    )
-    
-    # Model
-    model = ResNet18(in_channels=in_channels, num_classes=NUM_CLASSES, use_se=use_se)
-    params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {params:,}")
-    
-    # Train
-    train_model(model, train_loader, val_loader, epochs=epochs, lr=lr,
-                label_smoothing=label_smoothing, use_mixup=use_mixup)
-    
-    # Inference
-    if TEST_CSV.exists():
-        print("\nRunning inference...")
-        model.load_state_dict(torch.load("resnet18_best.pth", map_location=DEVICE, weights_only=True))
-        model = model.to(DEVICE)
-        
-        test_loader = DataLoader(
-            TestDataset(TEST_CSV, TEST_AUDIO_DIR, CACHE_DIR, use_3ch=use_3ch),
-            batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True
-        )
-        
-        predictions = predict(model, test_loader)
-        save_submission(predictions, "resnet18.csv")
-
-
-def run_cv_ensemble(
+def run_8fold_cv(
     batch_size=32,
     epochs=60,
     lr=1e-3,
@@ -592,7 +476,6 @@ def run_cv_ensemble(
     use_se=True,
     use_mixup=True,
     label_smoothing=0.1,
-    use_3ch=True,
 ):
     """
     8-fold cross-validation with ensemble prediction.
@@ -602,14 +485,13 @@ def run_cv_ensemble(
         print(f"Error: {TRAIN_CSV} not found")
         return
     
-    in_channels = 3 if use_3ch else 1
-    
     print("=" * 60)
-    print("ResNet-18 - 8-Fold CV Ensemble")
+    print("ResNet-101 - 8-Fold Cross-Validation Ensemble")
     print("=" * 60)
-    print(f"Features: {in_channels}-channel (Mel+Delta+Delta2)")
+    print(f"Features: 3-channel (Mel+Delta+Delta2)")
+    print(f"Model: ResNet-101 (101 layers)")
+    print(f"SE attention: {use_se}")
     print(f"Epochs per fold: {epochs}")
-    print(f"Total models: 8")
     print("=" * 60)
     
     model_paths = []
@@ -626,23 +508,21 @@ def run_cv_ensemble(
         
         # Data loaders
         train_loader = DataLoader(
-            AudioDataset(TRAIN_CSV, AUDIO_DIR, train_folds, CACHE_DIR,
-                        augment=True, use_3ch=use_3ch),
+            AudioDataset(TRAIN_CSV, AUDIO_DIR, train_folds, CACHE_DIR, augment=True),
             batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True
         )
         val_loader = DataLoader(
-            AudioDataset(TRAIN_CSV, AUDIO_DIR, [val_fold], CACHE_DIR,
-                        augment=False, use_3ch=use_3ch),
+            AudioDataset(TRAIN_CSV, AUDIO_DIR, [val_fold], CACHE_DIR, augment=False),
             batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True
         )
         
         # Model
-        model = ResNet18(in_channels=in_channels, num_classes=NUM_CLASSES, use_se=use_se)
+        model = ResNet101(in_channels=3, num_classes=NUM_CLASSES, use_se=use_se)
+        params = sum(p.numel() for p in model.parameters())
         if val_fold == 1:
-            params = sum(p.numel() for p in model.parameters())
             print(f"Model parameters: {params:,}")
         
-        save_path = f"resnet18_fold{val_fold}.pth"
+        save_path = f"resnet101_fold{val_fold}.pth"
         
         # Train
         train_model(model, train_loader, val_loader, epochs=epochs, lr=lr,
@@ -650,8 +530,7 @@ def run_cv_ensemble(
         
         # Load best and evaluate
         model.load_state_dict(torch.load(save_path, map_location=DEVICE, weights_only=True))
-        _, val_acc, val_f1, val_score = evaluate(model, val_loader, 
-                                                  nn.CrossEntropyLoss(), DEVICE)
+        _, val_acc, val_f1, val_score = evaluate(model, val_loader, nn.CrossEntropyLoss(), DEVICE)
         
         model_paths.append(save_path)
         val_scores.append(val_score)
@@ -672,8 +551,6 @@ def run_cv_ensemble(
         
         # Compute weights from val_scores (softmax with temperature)
         scores_arr = np.array(val_scores)
-        # Use softmax with temperature=10 to sharpen the weights
-        # Higher val_score -> higher weight
         temperature = 10.0
         weights = np.exp(scores_arr * temperature)
         weights = weights / weights.sum()  # normalize to sum=1
@@ -683,17 +560,16 @@ def run_cv_ensemble(
             print(f"  Fold {i+1}: score={score:.4f}, weight={w:.4f}")
         
         test_loader = DataLoader(
-            TestDataset(TEST_CSV, TEST_AUDIO_DIR, CACHE_DIR, use_3ch=use_3ch),
+            TestDataset(TEST_CSV, TEST_AUDIO_DIR, CACHE_DIR),
             batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True
         )
         
-        # Collect predictions from all models
         all_probs = []
         file_names = None
         
         for i, model_path in enumerate(model_paths):
             print(f"Loading model {i+1}/{len(model_paths)}...")
-            model = ResNet18(in_channels=in_channels, num_classes=NUM_CLASSES, use_se=use_se)
+            model = ResNet101(in_channels=3, num_classes=NUM_CLASSES, use_se=use_se)
             model.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
             model = model.to(DEVICE)
             model.eval()
@@ -712,8 +588,6 @@ def run_cv_ensemble(
                 file_names = names
         
         # Weighted average probabilities
-        # all_probs: list of (n_samples, n_classes) arrays
-        # weights: (n_models,) array
         weighted_probs = np.zeros_like(all_probs[0])
         for i, (probs, w) in enumerate(zip(all_probs, weights)):
             weighted_probs += w * probs
@@ -721,38 +595,19 @@ def run_cv_ensemble(
         predictions = [(name, int(np.argmax(weighted_probs[i]))) 
                       for i, name in enumerate(file_names)]
         
-        # Save submission
-        save_submission(predictions, "resnet18_ensemble.csv")
+        save_submission(predictions, "resnet101_ensemble.csv")
         print(f"\nWeighted 8-fold ensemble submission saved!")
     
     return val_scores
 
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) > 1 and sys.argv[1] == "--cv":
-        # 8-fold CV ensemble (recommended)
-        run_cv_ensemble(
-            batch_size=32,
-            epochs=60,
-            lr=1e-3,
-            use_se=True,
-            use_mixup=True,
-            label_smoothing=0.1,
-            use_3ch=True,
-        )
-    else:
-        # Single run
-        run(
-            train_folds=(1, 2, 3, 4, 5, 6),
-            val_folds=(7, 8),
-            batch_size=32,
-            epochs=60,
-            lr=1e-3,
-            use_se=True,
-            use_mixup=True,
-            label_smoothing=0.1,
-            use_3ch=True,
-        )
+    run_8fold_cv(
+        batch_size=32,
+        epochs=60,
+        lr=1e-3,
+        use_se=True,
+        use_mixup=True,
+        label_smoothing=0.1,
+    )
 

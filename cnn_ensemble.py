@@ -489,17 +489,49 @@ def run_cv_ensemble(n_folds=8, num_epochs=30, batch_size=32, lr=1e-3):
 # Inference Only (使用已训练好的模型)
 # =============================================================================
 
-def run_inference_only(val_scores=None, n_folds=8):
+def apply_tta(x, aug_type):
+    """Apply test-time augmentation."""
+    if aug_type == 0:
+        return x  # Original
+    elif aug_type == 1:
+        # Time shift left
+        shift = x.size(-1) // 10
+        return F.pad(x[:, :, :, shift:], (0, shift))
+    elif aug_type == 2:
+        # Time shift right
+        shift = x.size(-1) // 10
+        return F.pad(x[:, :, :, :-shift], (shift, 0))
+    elif aug_type == 3:
+        # Frequency mask (light)
+        x = x.clone()
+        f = random.randint(5, 10)
+        f0 = random.randint(0, x.size(2) - f)
+        x[:, :, f0:f0+f, :] = 0
+        return x
+    elif aug_type == 4:
+        # Add small noise
+        return x + torch.randn_like(x) * 0.01
+    return x
+
+
+def run_inference_only(val_scores=None, n_folds=8, use_tta=False):
     """
     只运行推理，使用已经训练好的模型。
     
     Args:
         val_scores: 每个fold的验证分数列表，用于加权平均
         n_folds: fold数量
+        use_tta: 是否使用测试时数据增强 (Test Time Augmentation)
     """
     print("="*60)
     print("Ensemble Inference Only (使用已训练模型)")
     print("="*60)
+    
+    if use_tta:
+        print("TTA enabled: 5 augmentations per sample")
+        tta_augs = 5
+    else:
+        tta_augs = 1
     
     # 默认验证分数（如果没有提供）
     if val_scores is None:
@@ -519,7 +551,7 @@ def run_inference_only(val_scores=None, n_folds=8):
     # 创建测试数据加载器
     test_loader = DataLoader(
         TestDataset(TEST_CSV, TEST_AUDIO_DIR, CACHE_DIR),
-        batch_size=64, shuffle=False, num_workers=4, pin_memory=True
+        batch_size=32 if use_tta else 64, shuffle=False, num_workers=4, pin_memory=True
     )
     
     all_probs = []
@@ -536,7 +568,18 @@ def run_inference_only(val_scores=None, n_folds=8):
         with torch.no_grad():
             for x, fnames in tqdm(test_loader, desc=f"Model {i+1}", leave=False):
                 x = x.to(DEVICE)
-                out = F.softmax(model(x), dim=1)
+                
+                if use_tta:
+                    # TTA: average predictions from multiple augmentations
+                    tta_probs = []
+                    for aug_idx in range(tta_augs):
+                        x_aug = apply_tta(x, aug_idx)
+                        out = F.softmax(model(x_aug), dim=1)
+                        tta_probs.append(out)
+                    out = torch.stack(tta_probs).mean(0)
+                else:
+                    out = F.softmax(model(x), dim=1)
+                
                 probs.append(out.cpu().numpy())
                 names.extend(fnames)
         
@@ -578,12 +621,26 @@ if __name__ == "__main__":
     import sys
     
     if len(sys.argv) > 1 and sys.argv[1] == "--inference":
-        # 只运行推理（使用已训练好的模型）
-        # 使用你之前的验证分数
+        # 只运行推理（不带TTA）
         val_scores = [0.7346, 0.7288, 0.6656, 0.7651, 0.7791, 0.7785, 0.7844, 0.7440]
-        run_inference_only(val_scores=val_scores)
+        run_inference_only(val_scores=val_scores, use_tta=False)
+    
+    elif len(sys.argv) > 1 and sys.argv[1] == "--tta":
+        # 推理 + TTA（测试时数据增强，预期+1-2%）
+        val_scores = [0.7346, 0.7288, 0.6656, 0.7651, 0.7791, 0.7785, 0.7844, 0.7440]
+        run_inference_only(val_scores=val_scores, use_tta=True)
+    
+    elif len(sys.argv) > 1 and sys.argv[1] == "--long":
+        # 更长训练（50 epochs，预期+1-2%）
+        run_cv_ensemble(
+            n_folds=8,
+            num_epochs=50,
+            batch_size=32,
+            lr=5e-4,
+        )
+    
     else:
-        # 完整训练 + 推理
+        # 8折交叉验证（默认）
         run_cv_ensemble(
             n_folds=8,
             num_epochs=30,
