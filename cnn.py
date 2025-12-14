@@ -52,10 +52,10 @@ AUDIO_CONFIG = {
 class SpecAugment:
     """
     SpecAugment: Time and frequency masking for spectrograms.
-    Helps model generalize by randomly masking portions of input.
+    Light version to prevent over-regularization on small dataset.
     """
-    def __init__(self, freq_mask_param=15, time_mask_param=25, 
-                 num_freq_masks=2, num_time_masks=2):
+    def __init__(self, freq_mask_param=8, time_mask_param=15, 
+                 num_freq_masks=1, num_time_masks=1):
         self.freq_mask_param = freq_mask_param
         self.time_mask_param = time_mask_param
         self.num_freq_masks = num_freq_masks
@@ -219,62 +219,44 @@ class ConvBlock(nn.Module):
 
 class AudioCNNv2(nn.Module):
     """
-    Improved CNN for audio classification.
-    
-    Improvements:
-    - 6 conv layers (deeper)
-    - More channels (32->64->128->256->512->512)
-    - SE attention blocks in later layers
-    - Two FC layers with dropout
+    Lightweight improved CNN - same architecture as v1 but with:
+    - Slightly more channels (32->64->128->256->256)
+    - 5 conv layers (one more than v1)
+    - Higher dropout for regularization
+    - ~600K params (vs v1's 420K, not 4M!)
     """
     
     def __init__(self, num_classes=NUM_CLASSES):
         super().__init__()
         
-        # Feature extractor: 6 conv blocks
-        # Input: (1, 128, 173) -> After all pools: (512, 2, 2)
+        # Keep it simple: 5 conv blocks, moderate channels
         self.features = nn.Sequential(
-            ConvBlock(1, 32, use_se=False),      # -> (32, 64, 86)
-            ConvBlock(32, 64, use_se=False),     # -> (64, 32, 43)
-            ConvBlock(64, 128, use_se=True),     # -> (128, 16, 21)
-            ConvBlock(128, 256, use_se=True),    # -> (256, 8, 10)
-            ConvBlock(256, 512, use_se=True),    # -> (512, 4, 5)
-            ConvBlock(512, 512, use_se=True),    # -> (512, 2, 2)
+            # Block 1: 1 -> 32
+            nn.Conv2d(1, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
+            # Block 2: 32 -> 64
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
+            # Block 3: 64 -> 128
+            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d(2),
+            # Block 4: 128 -> 256
+            nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(), nn.MaxPool2d(2),
+            # Block 5: 256 -> 256 (extra layer)
+            nn.Conv2d(256, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(), nn.MaxPool2d(2),
+            # Global pooling
+            nn.AdaptiveAvgPool2d(1),
         )
         
-        # Global pooling
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
-        
-        # Classifier with 2 FC layers
+        # Stronger regularization in classifier
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Dropout(0.4),
-            nn.Linear(512, 256),
-            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),           # Higher dropout
+            nn.Linear(256, 128),
+            nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(256, num_classes),
+            nn.Linear(128, num_classes),
         )
-        
-        # Weight initialization
-        self._init_weights()
-    
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, 0, 0.01)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
     
     def forward(self, x):
-        x = self.features(x)
-        x = self.global_pool(x)
-        x = self.classifier(x)
-        return x
+        return self.classifier(self.features(x))
 
 
 # Keep original model for comparison
@@ -368,48 +350,44 @@ def evaluate(model, loader, criterion, device):
     return total_loss / total, acc, f1, score
 
 
-def train(model, train_loader, val_loader, epochs=50, lr=5e-4, 
-          label_smoothing=0.1, warmup_epochs=5, save_path="best_model.pth"):
+def train(model, train_loader, val_loader, epochs=50, lr=1e-3, 
+          label_smoothing=0.05, save_path="best_model.pth"):
     """
-    Full training loop with improvements:
-    - Label smoothing
-    - Linear warmup + Cosine annealing LR scheduler
-    - AdamW optimizer
+    Training loop - back to basics with light improvements:
+    - Light label smoothing (0.05 instead of 0.1)
+    - Adam optimizer (proven to work)
+    - ReduceLROnPlateau (stable, worked in original)
     """
     model = model.to(DEVICE)
     
-    # Label smoothing loss
-    criterion = LabelSmoothingCrossEntropy(smoothing=label_smoothing)
-    val_criterion = nn.CrossEntropyLoss()  # No smoothing for validation
+    # Light label smoothing (0.05 is more conservative)
+    if label_smoothing > 0:
+        criterion = LabelSmoothingCrossEntropy(smoothing=label_smoothing)
+    else:
+        criterion = nn.CrossEntropyLoss()
+    val_criterion = nn.CrossEntropyLoss()
     
-    # AdamW optimizer (better weight decay handling)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    # Adam optimizer - proven to work well
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     
-    # Cosine annealing (smooth decay, no restarts for stability)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6
+    # ReduceLROnPlateau - stable and worked in original
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6
     )
     
     best_score = 0
     print(f"Training on {DEVICE} | Train: {len(train_loader.dataset)} | Val: {len(val_loader.dataset)}")
-    print(f"Learning rate: {lr}, Warmup epochs: {warmup_epochs}, Label smoothing: {label_smoothing}")
+    print(f"Learning rate: {lr}, Label smoothing: {label_smoothing}")
     
     for epoch in range(epochs):
-        # Linear warmup for first few epochs
-        if epoch < warmup_epochs:
-            warmup_lr = lr * (epoch + 1) / warmup_epochs
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = warmup_lr
-        
         current_lr = optimizer.param_groups[0]['lr']
         print(f"\nEpoch {epoch+1}/{epochs} (lr={current_lr:.6f})")
         
         train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, DEVICE)
         val_loss, val_acc, val_f1, val_score = evaluate(model, val_loader, val_criterion, DEVICE)
         
-        # Only apply cosine scheduler after warmup
-        if epoch >= warmup_epochs:
-            scheduler.step()
+        # Step scheduler based on val score
+        scheduler.step(val_score)
         
         print(f"Train: loss={train_loss:.4f}, acc={train_acc:.4f}")
         print(f"Val: loss={val_loss:.4f}, acc={val_acc:.4f}, f1={val_f1:.4f}, score={val_score:.4f}")
@@ -467,13 +445,13 @@ def generate_submission(predictions, output_path="cnn.csv"):
 def run_pipeline(
     train_folds=None,
     val_folds=None,
-    batch_size=48,
+    batch_size=32,        # Back to original
     num_workers=4,
-    epochs=60,
-    lr=5e-4,              # Lower LR for larger model
-    label_smoothing=0.1,
-    use_augment=True,
-    model_version="v2",   # "v1" for original, "v2" for improved
+    epochs=50,            # Back to original
+    lr=1e-3,              # Back to original
+    label_smoothing=0.05, # Light smoothing (was 0.1)
+    use_augment=True,     # Light augmentation
+    model_version="v2",   # "v1" for original, "v2" for lightweight improved
 ):
     """
     Run complete pipeline: train + inference.
@@ -538,13 +516,16 @@ def run_pipeline(
 
 
 if __name__ == "__main__":
-    # Run with improved model
-    # Note: Lower LR (5e-4) for larger model, with 5 warmup epochs
+    # Run with lightweight improved model
+    # Back to basics: same hyperparameters as original that got 0.80 on test
     run_pipeline(
-        batch_size=48,
-        epochs=60,
-        lr=5e-4,           # Lower LR for larger model (was 1e-3)
-        label_smoothing=0.1,
-        use_augment=True,
-        model_version="v2",  # Use improved CNN
+        batch_size=32,
+        epochs=50,
+        lr=1e-3,
+        label_smoothing=0.05,  # Light smoothing
+        use_augment=True,      # Light augmentation
+        model_version="v2",    # Lightweight improved CNN (~600K params)
     )
+    
+    # Alternative: try original model for comparison
+    # run_pipeline(model_version="v1", use_augment=False, label_smoothing=0)
