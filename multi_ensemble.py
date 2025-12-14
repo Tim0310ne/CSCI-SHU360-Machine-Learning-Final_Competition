@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Multi-Architecture Ensemble (32 models)
-Combines predictions from 4 different architectures for maximum accuracy.
+Multi-Architecture Ensemble (40 models)
+Combines predictions from 5 different architectures for maximum accuracy.
 
 Models:
-- AudioResNet (1-channel): model_fold1.pth ~ model_fold8.pth
-- ResNet18 (3-channel): resnet18_fold1.pth ~ resnet18_fold8.pth
-- ResNet101 (3-channel): resnet101_fold1.pth ~ resnet101_fold8.pth
-- EfficientNet-B1 (3-channel): efficientnet_b1_fold1.pth ~ efficientnet_b1_fold8.pth
+- AudioResNet (1-channel): model_fold1.pth ~ model_fold8.pth (8 models)
+- ResNet18 (3-channel): resnet18_fold1.pth ~ resnet18_fold8.pth (8 models)
+- ResNet34 (3-channel): resnet34_fold1.pth ~ resnet34_fold8.pth (8 models)
+- ResNet101 (3-channel): resnet101_fold1.pth ~ resnet101_fold8.pth (8 models)
+- EfficientNet-B1 (3-channel): efficientnet_b1_fold1.pth ~ efficientnet_b1_fold8.pth (8 models)
 
-Total: 32 models
+Total: 40 models
 Expected improvement: +3-5% over single architecture
 """
 
@@ -281,7 +282,47 @@ class ResNet18(nn.Module):
 
 
 # =============================================================================
-# Model 3: ResNet101 (3-channel) - from resnet101.py
+# Model 3: ResNet34 (3-channel) - from resnet34_new.py
+# =============================================================================
+
+class ResNet34(nn.Module):
+    """ResNet-34 for audio (matching resnet34_new.py). [3,4,6,3] blocks."""
+    def __init__(self, in_channels=3, num_classes=NUM_CLASSES, use_se=True):
+        super().__init__()
+        
+        self.conv1 = nn.Conv2d(in_channels, 64, 3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        
+        # [3, 4, 6, 3] blocks for ResNet-34
+        self.layer1 = self._make_layer(64, 64, 3, stride=1, use_se=False)
+        self.layer2 = self._make_layer(64, 128, 4, stride=2, use_se=use_se)
+        self.layer3 = self._make_layer(128, 256, 6, stride=2, use_se=use_se)
+        self.layer4 = self._make_layer(256, 512, 3, stride=2, use_se=use_se)
+        
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(0.4)
+        self.fc = nn.Linear(512, num_classes)
+    
+    def _make_layer(self, in_ch, out_ch, num_blocks, stride, use_se):
+        layers = [BasicBlockSE(in_ch, out_ch, stride, use_se)]
+        for _ in range(1, num_blocks):
+            layers.append(BasicBlockSE(out_ch, out_ch, 1, use_se))
+        return nn.Sequential(*layers)
+    
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.dropout(x)
+        return self.fc(x)
+
+
+# =============================================================================
+# Model 4: ResNet101 (3-channel) - from resnet101.py
 # =============================================================================
 
 class Bottleneck(nn.Module):
@@ -392,10 +433,10 @@ class EfficientNetB1(nn.Module):
 
 def run_multi_ensemble():
     """
-    Combine predictions from 4 architectures (32 models total).
+    Combine predictions from 5 architectures (40 models total).
     """
     print("="*60)
-    print("Multi-Architecture Ensemble (32 models)")
+    print("Multi-Architecture Ensemble (40 models)")
     print("="*60)
     print(f"Device: {DEVICE}")
     
@@ -413,6 +454,13 @@ def run_multi_ensemble():
             "model_class": ResNet18,
             "model_kwargs": {"in_channels": 3, "use_se": True},
             "paths": [f"resnet18_fold{i}.pth" for i in range(1, 9)],
+            "channels": 3,
+        },
+        {
+            "name": "ResNet34",
+            "model_class": ResNet34,
+            "model_kwargs": {"in_channels": 3, "use_se": True},
+            "paths": [f"resnet34_fold{i}.pth" for i in range(1, 9)],
             "channels": 3,
         },
         {
