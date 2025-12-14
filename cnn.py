@@ -1,9 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Urban Sound Classification with CNN
+Urban Sound Classification with Improved CNN
 Full pipeline: Data -> Feature Extraction -> Training -> Inference
+
+Improvements over baseline:
+- Deeper network (6 conv layers)
+- SE attention blocks
+- SpecAugment data augmentation
+- Label smoothing
+- Cosine annealing LR scheduler
 """
 
+import random
 import numpy as np
 import pandas as pd
 import torch
@@ -29,20 +37,8 @@ CACHE_DIR = BASE_DIR / "mel_cache"
 NUM_CLASSES = 10
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# =============================================================================
-# Train/Validation Split Configuration (Fold-based, NO random shuffle!)
-# =============================================================================
-# IMPORTANT: Data is pre-organized into 8 folds to prevent data leakage.
-# Related audio segments from the same source are split across files.
-# Using random shuffle (e.g., train_test_split with shuffle=True) will cause
-# data leakage and artificially inflate validation scores.
-#
-# Dataset distribution (total ~7000 samples):
-#   - Folds 1-6: ~75% for training
-#   - Folds 7-8: ~25% for validation
-
-TRAIN_FOLDS = [1, 2, 3, 4, 5, 6]  # Training set: Folds 1-6
-VAL_FOLDS = [7, 8]                 # Validation set: Folds 7-8
+TRAIN_FOLDS = [1, 2, 3, 4, 5, 6]
+VAL_FOLDS = [7, 8]
 
 AUDIO_CONFIG = {
     "sr": 22050, "n_mels": 128, "n_fft": 2048,
@@ -50,58 +46,42 @@ AUDIO_CONFIG = {
 }
 
 # =============================================================================
-# Data Split Utilities
+# Data Augmentation
 # =============================================================================
 
-def get_fold_split(csv_path=TRAIN_CSV):
+class SpecAugment:
     """
-    Create train/val DataFrames based on fold configuration.
-    NO random shuffling - strictly fold-based to prevent data leakage.
-    
-    Returns:
-        train_df: DataFrame with training samples (folds 1-6)
-        val_df: DataFrame with validation samples (folds 7-8)
+    SpecAugment: Time and frequency masking for spectrograms.
+    Helps model generalize by randomly masking portions of input.
     """
-    df = pd.read_csv(csv_path)
+    def __init__(self, freq_mask_param=15, time_mask_param=25, 
+                 num_freq_masks=2, num_time_masks=2):
+        self.freq_mask_param = freq_mask_param
+        self.time_mask_param = time_mask_param
+        self.num_freq_masks = num_freq_masks
+        self.num_time_masks = num_time_masks
     
-    train_df = df[df["fold"].isin(TRAIN_FOLDS)].reset_index(drop=True)
-    val_df = df[df["fold"].isin(VAL_FOLDS)].reset_index(drop=True)
-    
-    return train_df, val_df
-
-
-def show_fold_distribution(csv_path=TRAIN_CSV):
-    """Display fold and class distribution for verification."""
-    df = pd.read_csv(csv_path)
-    
-    print("=" * 60)
-    print("Dataset Fold Distribution")
-    print("=" * 60)
-    
-    # Fold distribution
-    fold_counts = df["fold"].value_counts().sort_index()
-    print("\nSamples per fold:")
-    for fold, count in fold_counts.items():
-        split = "TRAIN" if fold in TRAIN_FOLDS else "VAL"
-        print(f"  Fold {fold}: {count:4d} samples [{split}]")
-    
-    # Train/Val split summary
-    train_df, val_df = get_fold_split(csv_path)
-    total = len(df)
-    print(f"\nTrain/Val Split:")
-    print(f"  Training (folds {TRAIN_FOLDS}): {len(train_df):4d} samples ({100*len(train_df)/total:.1f}%)")
-    print(f"  Validation (folds {VAL_FOLDS}): {len(val_df):4d} samples ({100*len(val_df)/total:.1f}%)")
-    
-    # Class distribution
-    print(f"\nClass distribution:")
-    class_counts = df.groupby("class")["classID"].first().reset_index()
-    for _, row in df["class"].value_counts().items():
-        pass  # Skip detailed class print for brevity
-    print(f"  Total classes: {df['classID'].nunique()}")
-    print(f"  Total samples: {total}")
-    
-    return train_df, val_df
-
+    def __call__(self, mel_spec):
+        """Apply augmentation to mel spectrogram tensor."""
+        if mel_spec.dim() == 2:
+            mel_spec = mel_spec.unsqueeze(0)
+        
+        _, n_mels, time_steps = mel_spec.shape
+        augmented = mel_spec.clone()
+        
+        # Frequency masking
+        for _ in range(self.num_freq_masks):
+            f = random.randint(0, min(self.freq_mask_param, n_mels - 1))
+            f0 = random.randint(0, n_mels - f)
+            augmented[:, f0:f0 + f, :] = 0
+        
+        # Time masking
+        for _ in range(self.num_time_masks):
+            t = random.randint(0, min(self.time_mask_param, time_steps - 1))
+            t0 = random.randint(0, time_steps - t)
+            augmented[:, :, t0:t0 + t] = 0
+        
+        return augmented
 
 # =============================================================================
 # Feature Extraction
@@ -111,19 +91,15 @@ def extract_mel_spectrogram(audio_path, config=AUDIO_CONFIG):
     """Convert audio file to normalized Log-Mel spectrogram."""
     y, _ = librosa.load(str(audio_path), sr=config["sr"])
     
-    # Pad or truncate to fixed duration
     if config["duration"]:
         target_len = int(config["sr"] * config["duration"])
         y = y[:target_len] if len(y) > target_len else np.pad(y, (0, max(0, target_len - len(y))))
     
-    # Compute Log-Mel spectrogram
     mel = librosa.feature.melspectrogram(
         y=y, sr=config["sr"], n_mels=config["n_mels"],
         n_fft=config["n_fft"], hop_length=config["hop_length"], fmax=config["fmax"]
     )
     mel_db = librosa.power_to_db(mel, ref=np.max)
-    
-    # Normalize to [0, 1]
     mel_db = (mel_db - mel_db.min()) / (mel_db.max() - mel_db.min() + 1e-8)
     return mel_db.astype(np.float32)
 
@@ -132,9 +108,9 @@ def extract_mel_spectrogram(audio_path, config=AUDIO_CONFIG):
 # =============================================================================
 
 class AudioDataset(Dataset):
-    """Dataset for training/validation with labels."""
+    """Dataset for training/validation with optional augmentation."""
     
-    def __init__(self, csv_path, audio_dir, folds=None, cache_dir=None):
+    def __init__(self, csv_path, audio_dir, folds=None, cache_dir=None, augment=False):
         self.audio_dir = Path(audio_dir)
         self.df = pd.read_csv(csv_path)
         if folds:
@@ -142,6 +118,9 @@ class AudioDataset(Dataset):
         self.cache_dir = Path(cache_dir) if cache_dir else None
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.augment = augment
+        self.spec_augment = SpecAugment() if augment else None
     
     def __len__(self):
         return len(self.df)
@@ -150,7 +129,6 @@ class AudioDataset(Dataset):
         row = self.df.iloc[idx]
         fold, fname, label = row["fold"], row["slice_file_name"], int(row["classID"])
         
-        # Try loading from cache
         cache_path = self.cache_dir / f"fold{fold}_{Path(fname).stem}.npy" if self.cache_dir else None
         if cache_path and cache_path.exists():
             mel = np.load(cache_path)
@@ -159,7 +137,13 @@ class AudioDataset(Dataset):
             if cache_path:
                 np.save(cache_path, mel)
         
-        return torch.from_numpy(mel).unsqueeze(0), torch.tensor(label)
+        mel_tensor = torch.from_numpy(mel).unsqueeze(0)
+        
+        # Apply augmentation during training
+        if self.augment and self.spec_augment and random.random() > 0.5:
+            mel_tensor = self.spec_augment(mel_tensor)
+        
+        return mel_tensor, torch.tensor(label)
 
 
 class TestDataset(Dataset):
@@ -189,11 +173,113 @@ class TestDataset(Dataset):
         return torch.from_numpy(mel).unsqueeze(0), fname
 
 # =============================================================================
-# CNN Model
+# SE (Squeeze-and-Excitation) Block
 # =============================================================================
 
+class SEBlock(nn.Module):
+    """
+    Squeeze-and-Excitation block for channel attention.
+    Adaptively recalibrates channel-wise feature responses.
+    """
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.squeeze = nn.AdaptiveAvgPool2d(1)
+        self.excitation = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.squeeze(x).view(b, c)
+        y = self.excitation(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+# =============================================================================
+# Improved CNN Model
+# =============================================================================
+
+class ConvBlock(nn.Module):
+    """Conv -> BN -> ReLU -> (optional SE) -> Pool"""
+    def __init__(self, in_ch, out_ch, use_se=False):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.bn = nn.BatchNorm2d(out_ch)
+        self.se = SEBlock(out_ch) if use_se else nn.Identity()
+        self.pool = nn.MaxPool2d(2)
+    
+    def forward(self, x):
+        x = F.relu(self.bn(self.conv(x)))
+        x = self.se(x)
+        x = self.pool(x)
+        return x
+
+
+class AudioCNNv2(nn.Module):
+    """
+    Improved CNN for audio classification.
+    
+    Improvements:
+    - 6 conv layers (deeper)
+    - More channels (32->64->128->256->512->512)
+    - SE attention blocks in later layers
+    - Two FC layers with dropout
+    """
+    
+    def __init__(self, num_classes=NUM_CLASSES):
+        super().__init__()
+        
+        # Feature extractor: 6 conv blocks
+        # Input: (1, 128, 173) -> After all pools: (512, 2, 2)
+        self.features = nn.Sequential(
+            ConvBlock(1, 32, use_se=False),      # -> (32, 64, 86)
+            ConvBlock(32, 64, use_se=False),     # -> (64, 32, 43)
+            ConvBlock(64, 128, use_se=True),     # -> (128, 16, 21)
+            ConvBlock(128, 256, use_se=True),    # -> (256, 8, 10)
+            ConvBlock(256, 512, use_se=True),    # -> (512, 4, 5)
+            ConvBlock(512, 512, use_se=True),    # -> (512, 2, 2)
+        )
+        
+        # Global pooling
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        
+        # Classifier with 2 FC layers
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(0.4),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes),
+        )
+        
+        # Weight initialization
+        self._init_weights()
+    
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        x = self.features(x)
+        x = self.global_pool(x)
+        x = self.classifier(x)
+        return x
+
+
+# Keep original model for comparison
 class AudioCNN(nn.Module):
-    """Simple CNN for audio classification."""
+    """Original simple CNN (baseline)."""
     
     def __init__(self, num_classes=NUM_CLASSES):
         super().__init__()
@@ -212,6 +298,27 @@ class AudioCNN(nn.Module):
     
     def forward(self, x):
         return self.classifier(self.features(x))
+
+# =============================================================================
+# Label Smoothing Loss
+# =============================================================================
+
+class LabelSmoothingCrossEntropy(nn.Module):
+    """Cross entropy with label smoothing for regularization."""
+    def __init__(self, smoothing=0.1):
+        super().__init__()
+        self.smoothing = smoothing
+    
+    def forward(self, pred, target):
+        n_classes = pred.size(-1)
+        log_preds = F.log_softmax(pred, dim=-1)
+        
+        with torch.no_grad():
+            true_dist = torch.zeros_like(log_preds)
+            true_dist.fill_(self.smoothing / (n_classes - 1))
+            true_dist.scatter_(1, target.unsqueeze(1), 1.0 - self.smoothing)
+        
+        return (-true_dist * log_preds).sum(dim=-1).mean()
 
 # =============================================================================
 # Training & Evaluation
@@ -261,21 +368,48 @@ def evaluate(model, loader, criterion, device):
     return total_loss / total, acc, f1, score
 
 
-def train(model, train_loader, val_loader, epochs=50, lr=1e-3, save_path="best_model.pth"):
-    """Full training loop."""
+def train(model, train_loader, val_loader, epochs=50, lr=5e-4, 
+          label_smoothing=0.1, warmup_epochs=5, save_path="best_model.pth"):
+    """
+    Full training loop with improvements:
+    - Label smoothing
+    - Linear warmup + Cosine annealing LR scheduler
+    - AdamW optimizer
+    """
     model = model.to(DEVICE)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
+    
+    # Label smoothing loss
+    criterion = LabelSmoothingCrossEntropy(smoothing=label_smoothing)
+    val_criterion = nn.CrossEntropyLoss()  # No smoothing for validation
+    
+    # AdamW optimizer (better weight decay handling)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    
+    # Cosine annealing (smooth decay, no restarts for stability)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6
+    )
     
     best_score = 0
     print(f"Training on {DEVICE} | Train: {len(train_loader.dataset)} | Val: {len(val_loader.dataset)}")
+    print(f"Learning rate: {lr}, Warmup epochs: {warmup_epochs}, Label smoothing: {label_smoothing}")
     
     for epoch in range(epochs):
-        print(f"\nEpoch {epoch+1}/{epochs}")
+        # Linear warmup for first few epochs
+        if epoch < warmup_epochs:
+            warmup_lr = lr * (epoch + 1) / warmup_epochs
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = warmup_lr
+        
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"\nEpoch {epoch+1}/{epochs} (lr={current_lr:.6f})")
+        
         train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, DEVICE)
-        val_loss, val_acc, val_f1, val_score = evaluate(model, val_loader, criterion, DEVICE)
-        scheduler.step(val_score)
+        val_loss, val_acc, val_f1, val_score = evaluate(model, val_loader, val_criterion, DEVICE)
+        
+        # Only apply cosine scheduler after warmup
+        if epoch >= warmup_epochs:
+            scheduler.step()
         
         print(f"Train: loss={train_loss:.4f}, acc={train_acc:.4f}")
         print(f"Val: loss={val_loss:.4f}, acc={val_acc:.4f}, f1={val_f1:.4f}, score={val_score:.4f}")
@@ -306,11 +440,25 @@ def predict(model, test_loader):
 
 
 def generate_submission(predictions, output_path="cnn.csv"):
-    """Save predictions to CSV."""
-    df = pd.DataFrame(predictions, columns=["slice_file_name", "classID"])
-    df.to_csv(output_path, index=False)
-    print(f"Submission saved to {output_path} ({len(df)} predictions)")
-    return df
+    """Save predictions to CSV in Kaggle submission format."""
+    submission_df = pd.DataFrame({
+        "ID": range(len(predictions)),
+        "TARGET": [pred for _, pred in predictions]
+    })
+    
+    submission_df["ID"] = submission_df["ID"].astype(int)
+    submission_df["TARGET"] = submission_df["TARGET"].astype(int)
+    
+    submission_df.to_csv(output_path, index=False)
+    
+    print(f"\nSubmission saved to: {output_path}")
+    print(f"Total predictions: {len(submission_df)}")
+    print(f"\nFirst 10 rows:")
+    print(submission_df.head(10).to_string(index=False))
+    print(f"\nClass distribution in predictions:")
+    print(submission_df["TARGET"].value_counts().sort_index())
+    
+    return submission_df
 
 # =============================================================================
 # Main Pipeline
@@ -319,60 +467,68 @@ def generate_submission(predictions, output_path="cnn.csv"):
 def run_pipeline(
     train_folds=None,
     val_folds=None,
-    batch_size=32,
-    epochs=50,
-    lr=1e-3,
+    batch_size=48,
+    num_workers=4,
+    epochs=60,
+    lr=5e-4,              # Lower LR for larger model
+    label_smoothing=0.1,
+    use_augment=True,
+    model_version="v2",   # "v1" for original, "v2" for improved
 ):
     """
     Run complete pipeline: train + inference.
     
     Args:
-        train_folds: List of fold numbers for training (default: TRAIN_FOLDS = [1,2,3,4,5,6])
-        val_folds: List of fold numbers for validation (default: VAL_FOLDS = [7,8])
-        batch_size: Batch size for training
-        epochs: Number of training epochs
-        lr: Learning rate
-    
-    Note: We use fold-based splitting (NOT random shuffle) to prevent data leakage.
+        model_version: "v1" for original CNN, "v2" for improved CNN with SE blocks
+        use_augment: Whether to use SpecAugment during training
+        label_smoothing: Label smoothing factor (0 = no smoothing)
     """
-    # Use global defaults if not specified
     if train_folds is None:
         train_folds = TRAIN_FOLDS
     if val_folds is None:
         val_folds = VAL_FOLDS
     
-    # Check data exists
     if not TRAIN_CSV.exists():
         print(f"Error: {TRAIN_CSV} not found")
         return
     
-    # Create data loaders (shuffle=True only shuffles within training set, not across folds)
+    # Create data loaders
     print(f"Loading data... Train folds: {train_folds}, Val folds: {val_folds}")
+    print(f"Config: batch_size={batch_size}, num_workers={num_workers}, augment={use_augment}")
+    
     train_loader = DataLoader(
-        AudioDataset(TRAIN_CSV, AUDIO_DIR, train_folds, CACHE_DIR),
-        batch_size=batch_size, shuffle=True, num_workers=0  # shuffle within train set is OK
+        AudioDataset(TRAIN_CSV, AUDIO_DIR, train_folds, CACHE_DIR, augment=use_augment),
+        batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True
     )
     val_loader = DataLoader(
-        AudioDataset(TRAIN_CSV, AUDIO_DIR, val_folds, CACHE_DIR),
-        batch_size=batch_size, shuffle=False, num_workers=0
+        AudioDataset(TRAIN_CSV, AUDIO_DIR, val_folds, CACHE_DIR, augment=False),
+        batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True
     )
     
-    # Initialize and train model
-    model = AudioCNN()
+    # Initialize model
+    if model_version == "v2":
+        model = AudioCNNv2()
+        print("Using AudioCNNv2 (improved with SE blocks)")
+    else:
+        model = AudioCNN()
+        print("Using AudioCNN (original baseline)")
+    
     params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {params:,}")
     
-    train(model, train_loader, val_loader, epochs=epochs, lr=lr)
+    # Train
+    train(model, train_loader, val_loader, epochs=epochs, lr=lr, 
+          label_smoothing=label_smoothing, save_path="best_model.pth")
     
-    # Inference on test set
+    # Inference
     if TEST_CSV.exists():
         print("\nRunning inference...")
-        model.load_state_dict(torch.load("best_model.pth", map_location=DEVICE))
+        model.load_state_dict(torch.load("best_model.pth", map_location=DEVICE, weights_only=True))
         model = model.to(DEVICE)
         
         test_loader = DataLoader(
             TestDataset(TEST_CSV, TEST_AUDIO_DIR, CACHE_DIR),
-            batch_size=batch_size, shuffle=False, num_workers=0
+            batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True
         )
         
         predictions = predict(model, test_loader)
@@ -382,5 +538,13 @@ def run_pipeline(
 
 
 if __name__ == "__main__":
-    run_pipeline()
-
+    # Run with improved model
+    # Note: Lower LR (5e-4) for larger model, with 5 warmup epochs
+    run_pipeline(
+        batch_size=48,
+        epochs=60,
+        lr=5e-4,           # Lower LR for larger model (was 1e-3)
+        label_smoothing=0.1,
+        use_augment=True,
+        model_version="v2",  # Use improved CNN
+    )
