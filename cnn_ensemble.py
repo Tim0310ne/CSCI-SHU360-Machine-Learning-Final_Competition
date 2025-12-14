@@ -459,8 +459,16 @@ def run_cv_ensemble(n_folds=8, num_epochs=30, batch_size=32, lr=1e-3):
         if file_names is None:
             file_names = names
     
-    # Average probabilities from all models
-    avg_probs = np.mean(all_probs, axis=0)
+    # Weighted average based on validation scores (better models contribute more)
+    weights = np.array(val_scores)
+    weights = weights / weights.sum()  # Normalize to sum to 1
+    print(f"\nEnsemble weights: {[f'{w:.3f}' for w in weights]}")
+    
+    # Weighted average of probabilities
+    avg_probs = np.zeros_like(all_probs[0])
+    for i, (probs, w) in enumerate(zip(all_probs, weights)):
+        avg_probs += w * probs
+    
     predictions = [(name, int(np.argmax(avg_probs[i]))) for i, name in enumerate(file_names)]
     
     # Generate submission
@@ -478,15 +486,108 @@ def run_cv_ensemble(n_folds=8, num_epochs=30, batch_size=32, lr=1e-3):
     return mean_score, val_scores
 
 # =============================================================================
+# Inference Only (使用已训练好的模型)
+# =============================================================================
+
+def run_inference_only(val_scores=None, n_folds=8):
+    """
+    只运行推理，使用已经训练好的模型。
+    
+    Args:
+        val_scores: 每个fold的验证分数列表，用于加权平均
+        n_folds: fold数量
+    """
+    print("="*60)
+    print("Ensemble Inference Only (使用已训练模型)")
+    print("="*60)
+    
+    # 默认验证分数（如果没有提供）
+    if val_scores is None:
+        val_scores = [1.0] * n_folds  # 简单平均
+        print("Using simple average (equal weights)")
+    else:
+        print(f"Using weighted average based on val_scores")
+    
+    model_paths = [f"model_fold{i}.pth" for i in range(1, n_folds + 1)]
+    
+    # 检查模型文件是否存在
+    for path in model_paths:
+        if not Path(path).exists():
+            print(f"Error: Model file not found: {path}")
+            return
+    
+    # 创建测试数据加载器
+    test_loader = DataLoader(
+        TestDataset(TEST_CSV, TEST_AUDIO_DIR, CACHE_DIR),
+        batch_size=64, shuffle=False, num_workers=4, pin_memory=True
+    )
+    
+    all_probs = []
+    file_names = None
+    
+    for i, model_path in enumerate(model_paths):
+        print(f"Loading model {i+1}/{len(model_paths)}: {model_path}")
+        model = AudioResNet().to(DEVICE)
+        model.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
+        model.eval()
+        
+        probs = []
+        names = []
+        with torch.no_grad():
+            for x, fnames in tqdm(test_loader, desc=f"Model {i+1}", leave=False):
+                x = x.to(DEVICE)
+                out = F.softmax(model(x), dim=1)
+                probs.append(out.cpu().numpy())
+                names.extend(fnames)
+        
+        all_probs.append(np.vstack(probs))
+        if file_names is None:
+            file_names = names
+    
+    # 加权平均
+    weights = np.array(val_scores)
+    weights = weights / weights.sum()
+    print(f"\nEnsemble weights: {[f'{w:.3f}' for w in weights]}")
+    
+    avg_probs = np.zeros_like(all_probs[0])
+    for i, (probs, w) in enumerate(zip(all_probs, weights)):
+        avg_probs += w * probs
+    
+    predictions = [(name, int(np.argmax(avg_probs[i]))) for i, name in enumerate(file_names)]
+    
+    # 生成提交文件
+    submission_df = pd.DataFrame({
+        "ID": range(len(predictions)),
+        "TARGET": [pred for _, pred in predictions]
+    })
+    submission_df.to_csv("cnn.csv", index=False)
+    
+    print(f"\nSubmission saved to: cnn.csv")
+    print(f"Total predictions: {len(submission_df)}")
+    print(f"\nClass distribution:")
+    print(submission_df["TARGET"].value_counts().sort_index())
+    
+    return submission_df
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
 if __name__ == "__main__":
-    # 8-fold CV Ensemble - This is the key to 88+ score!
-    run_cv_ensemble(
-        n_folds=8,
-        num_epochs=30,    # 30 epochs per fold
-        batch_size=32,
-        lr=1e-3,
-    )
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "--inference":
+        # 只运行推理（使用已训练好的模型）
+        # 使用你之前的验证分数
+        val_scores = [0.7346, 0.7288, 0.6656, 0.7651, 0.7791, 0.7785, 0.7844, 0.7440]
+        run_inference_only(val_scores=val_scores)
+    else:
+        # 完整训练 + 推理
+        run_cv_ensemble(
+            n_folds=8,
+            num_epochs=30,
+            batch_size=32,
+            lr=1e-3,
+        )
 
