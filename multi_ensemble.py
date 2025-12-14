@@ -433,14 +433,14 @@ class EfficientNetB1(nn.Module):
 
 def run_multi_ensemble():
     """
-    Combine predictions from 5 architectures (40 models total).
+    Combine predictions from 3 architectures (24 models total).
     """
     print("="*60)
-    print("Multi-Architecture Ensemble (40 models)")
+    print("Multi-Architecture Ensemble (24 models)")
     print("="*60)
     print(f"Device: {DEVICE}")
     
-    # Model configurations
+    # Model configurations (3 architectures, 24 models total)
     models_config = [
         {
             "name": "AudioResNet",
@@ -461,20 +461,6 @@ def run_multi_ensemble():
             "model_class": ResNet34,
             "model_kwargs": {"in_channels": 3, "use_se": True},
             "paths": [f"resnet34_fold{i}.pth" for i in range(1, 9)],
-            "channels": 3,
-        },
-        {
-            "name": "ResNet101",
-            "model_class": ResNet101,
-            "model_kwargs": {"in_channels": 3, "use_se": True},
-            "paths": [f"resnet101_fold{i}.pth" for i in range(1, 9)],
-            "channels": 3,
-        },
-        {
-            "name": "EfficientNet-B1",
-            "model_class": EfficientNetB1,
-            "model_kwargs": {"in_channels": 3, "dropout": 0.3},
-            "paths": [f"efficientnet_b1_fold{i}.pth" for i in range(1, 9)],
             "channels": 3,
         },
     ]
