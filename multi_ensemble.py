@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Multi-Architecture Ensemble
-Combines predictions from multiple model architectures for better accuracy.
+Multi-Architecture Ensemble (32 models)
+Combines predictions from 4 different architectures for maximum accuracy.
 
 Models:
 - AudioResNet (1-channel): model_fold1.pth ~ model_fold8.pth
 - ResNet18 (3-channel): resnet18_fold1.pth ~ resnet18_fold8.pth
+- ResNet101 (3-channel): resnet101_fold1.pth ~ resnet101_fold8.pth
+- EfficientNet-B1 (3-channel): efficientnet_b1_fold1.pth ~ efficientnet_b1_fold8.pth
 
-Expected improvement: +2-4% over single architecture
+Total: 32 models
+Expected improvement: +3-5% over single architecture
 """
 
 import numpy as np
@@ -58,7 +61,7 @@ def extract_mel_1ch(audio_path, config=AUDIO_CONFIG):
 
 
 def extract_mel_3ch(audio_path, config=AUDIO_CONFIG):
-    """3-channel mel spectrogram (mel + delta + delta2) for ResNet18."""
+    """3-channel mel spectrogram (mel + delta + delta2)."""
     y, _ = librosa.load(str(audio_path), sr=config["sr"])
     
     target_len = int(config["sr"] * config["duration"])
@@ -130,10 +133,9 @@ class TestDataset3ch(Dataset):
         return torch.from_numpy(mel), fname
 
 # =============================================================================
-# Model Architectures
+# Model 1: AudioResNet (1-channel) - from cnn_ensemble.py
 # =============================================================================
 
-# --- AudioResNet (1-channel) ---
 class BasicBlock(nn.Module):
     def __init__(self, in_ch, out_ch, stride=1, downsample=None):
         super().__init__()
@@ -153,7 +155,7 @@ class BasicBlock(nn.Module):
 
 
 class AudioResNet(nn.Module):
-    """AudioResNet for 1-channel input (from cnn_ensemble.py)."""
+    """AudioResNet for 1-channel input."""
     def __init__(self, num_classes=NUM_CLASSES):
         super().__init__()
         self.conv1 = nn.Conv2d(1, 64, 3, stride=1, padding=1, bias=False)
@@ -194,9 +196,12 @@ class AudioResNet(nn.Module):
         return self.fc(x)
 
 
-# --- ResNet18 with SE (3-channel) - Matching resnet18.py exactly ---
+# =============================================================================
+# Model 2: ResNet18 with SE (3-channel) - from resnet18.py
+# =============================================================================
+
 class SEBlock(nn.Module):
-    """Squeeze-and-Excitation attention (matching resnet18.py)."""
+    """Squeeze-and-Excitation attention."""
     def __init__(self, channels, reduction=16):
         super().__init__()
         self.pool = nn.AdaptiveAvgPool2d(1)
@@ -215,7 +220,7 @@ class SEBlock(nn.Module):
 
 
 class BasicBlockSE(nn.Module):
-    """ResNet basic block with optional SE attention (matching resnet18.py)."""
+    """ResNet basic block with optional SE attention."""
     def __init__(self, in_ch, out_ch, stride=1, use_se=False):
         super().__init__()
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
@@ -225,7 +230,6 @@ class BasicBlockSE(nn.Module):
         
         self.se = SEBlock(out_ch) if use_se else nn.Identity()
         
-        # Shortcut for dimension mismatch
         self.shortcut = nn.Sequential()
         if stride != 1 or in_ch != out_ch:
             self.shortcut = nn.Sequential(
@@ -242,14 +246,13 @@ class BasicBlockSE(nn.Module):
 
 
 class ResNet18(nn.Module):
-    """ResNet-18 for audio (matching resnet18.py exactly)."""
+    """ResNet-18 for audio (matching resnet18.py)."""
     def __init__(self, in_channels=3, num_classes=NUM_CLASSES, use_se=True):
         super().__init__()
         
         self.conv1 = nn.Conv2d(in_channels, 64, 3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
         
-        # [2, 2, 2, 2] blocks, SE in layers 2-4
         self.layer1 = self._make_layer(64, 64, 2, stride=1, use_se=False)
         self.layer2 = self._make_layer(64, 128, 2, stride=2, use_se=use_se)
         self.layer3 = self._make_layer(128, 256, 2, stride=2, use_se=use_se)
@@ -276,17 +279,123 @@ class ResNet18(nn.Module):
         x = self.dropout(x)
         return self.fc(x)
 
+
+# =============================================================================
+# Model 3: ResNet101 (3-channel) - from resnet101.py
+# =============================================================================
+
+class Bottleneck(nn.Module):
+    """Bottleneck block for ResNet-101."""
+    expansion = 4
+    
+    def __init__(self, in_ch, out_ch, stride=1, downsample=None, use_se=False):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+        self.conv3 = nn.Conv2d(out_ch, out_ch * self.expansion, 1, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_ch * self.expansion)
+        
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.se = SEBlock(out_ch * self.expansion) if use_se else nn.Identity()
+    
+    def forward(self, x):
+        identity = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.relu(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
+        out = self.se(out)
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        out += identity
+        return self.relu(out)
+
+
+class ResNet101(nn.Module):
+    """ResNet-101 for audio (matching resnet101.py)."""
+    def __init__(self, in_channels=3, num_classes=NUM_CLASSES, use_se=True):
+        super().__init__()
+        
+        self.conv1 = nn.Conv2d(in_channels, 64, 7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(3, stride=2, padding=1)
+        
+        self.layer1 = self._make_layer(64, 64, 3, stride=1, use_se=False)
+        self.layer2 = self._make_layer(256, 128, 4, stride=2, use_se=use_se)
+        self.layer3 = self._make_layer(512, 256, 23, stride=2, use_se=use_se)
+        self.layer4 = self._make_layer(1024, 512, 3, stride=2, use_se=use_se)
+        
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(0.4)
+        self.fc = nn.Linear(512 * Bottleneck.expansion, num_classes)
+    
+    def _make_layer(self, in_ch, out_ch, num_blocks, stride, use_se):
+        downsample = None
+        if stride != 1 or in_ch != out_ch * Bottleneck.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch * Bottleneck.expansion, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_ch * Bottleneck.expansion)
+            )
+        layers = [Bottleneck(in_ch, out_ch, stride, downsample, use_se)]
+        for _ in range(1, num_blocks):
+            layers.append(Bottleneck(out_ch * Bottleneck.expansion, out_ch, use_se=use_se))
+        return nn.Sequential(*layers)
+    
+    def forward(self, x):
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.dropout(x)
+        return self.fc(x)
+
+
+# =============================================================================
+# Model 4: EfficientNet-B1 (3-channel) - from efficientnet_b1.py
+# =============================================================================
+
+class EfficientNetB1(nn.Module):
+    """EfficientNet-B1 for audio (matching efficientnet_b1.py)."""
+    def __init__(self, in_channels=3, num_classes=NUM_CLASSES, dropout=0.3):
+        super().__init__()
+        
+        from torchvision.models import efficientnet_b1
+        
+        self.efficientnet = efficientnet_b1(weights=None)
+        
+        # Modify first conv
+        self.efficientnet.features[0][0] = nn.Conv2d(
+            in_channels, 32, kernel_size=3, stride=2, padding=1, bias=False
+        )
+        
+        # Modify classifier
+        in_features = self.efficientnet.classifier[1].in_features
+        self.efficientnet.classifier = nn.Sequential(
+            nn.Dropout(p=dropout, inplace=True),
+            nn.Linear(in_features, num_classes)
+        )
+    
+    def forward(self, x):
+        return self.efficientnet(x)
+
+
 # =============================================================================
 # Multi-Architecture Ensemble
 # =============================================================================
 
 def run_multi_ensemble():
     """
-    Combine predictions from AudioResNet (1ch) and ResNet18 (3ch).
-    Total: 16 models (8 + 8)
+    Combine predictions from 4 architectures (32 models total).
     """
     print("="*60)
-    print("Multi-Architecture Ensemble (16 models)")
+    print("Multi-Architecture Ensemble (32 models)")
     print("="*60)
     print(f"Device: {DEVICE}")
     
@@ -297,43 +406,64 @@ def run_multi_ensemble():
             "model_class": AudioResNet,
             "model_kwargs": {},
             "paths": [f"model_fold{i}.pth" for i in range(1, 9)],
-            "dataset_class": TestDataset1ch,
-            "val_scores": [0.7530, 0.7275, 0.6908, 0.7685, 0.7712, 0.8241, 0.7726, 0.7717],  # 你的CV分数
+            "channels": 1,
         },
         {
             "name": "ResNet18",
             "model_class": ResNet18,
             "model_kwargs": {"in_channels": 3, "use_se": True},
             "paths": [f"resnet18_fold{i}.pth" for i in range(1, 9)],
-            "dataset_class": TestDataset3ch,
-            "val_scores": None,  # 如果有分数可以填入
+            "channels": 3,
+        },
+        {
+            "name": "ResNet101",
+            "model_class": ResNet101,
+            "model_kwargs": {"in_channels": 3, "use_se": True},
+            "paths": [f"resnet101_fold{i}.pth" for i in range(1, 9)],
+            "channels": 3,
+        },
+        {
+            "name": "EfficientNet-B1",
+            "model_class": EfficientNetB1,
+            "model_kwargs": {"in_channels": 3, "dropout": 0.3},
+            "paths": [f"efficientnet_b1_fold{i}.pth" for i in range(1, 9)],
+            "channels": 3,
         },
     ]
     
+    # Create data loaders (cache them)
+    print("\nPreparing data loaders...")
+    loader_1ch = DataLoader(
+        TestDataset1ch(TEST_CSV, TEST_AUDIO_DIR, CACHE_DIR),
+        batch_size=32, shuffle=False, num_workers=4, pin_memory=True
+    )
+    loader_3ch = DataLoader(
+        TestDataset3ch(TEST_CSV, TEST_AUDIO_DIR, CACHE_DIR),
+        batch_size=32, shuffle=False, num_workers=4, pin_memory=True
+    )
+    
     all_probs = []
-    all_weights = []
     file_names = None
+    total_models = 0
     
     for config in models_config:
         print(f"\n--- {config['name']} ---")
         
-        # Check if model files exist
+        # Check which model files exist
         existing_paths = [p for p in config["paths"] if Path(p).exists()]
         if not existing_paths:
             print(f"  No model files found, skipping...")
             continue
         
-        print(f"  Found {len(existing_paths)} models")
+        print(f"  Found {len(existing_paths)}/{len(config['paths'])} models")
         
-        # Create data loader
-        test_loader = DataLoader(
-            config["dataset_class"](TEST_CSV, TEST_AUDIO_DIR, CACHE_DIR),
-            batch_size=32, shuffle=False, num_workers=4, pin_memory=True
-        )
+        # Select appropriate data loader
+        loader = loader_1ch if config["channels"] == 1 else loader_3ch
         
         # Get predictions from each model
         for i, model_path in enumerate(existing_paths):
-            print(f"  Loading {model_path}...")
+            print(f"  Loading {model_path}...", end=" ")
+            
             model = config["model_class"](**config["model_kwargs"]).to(DEVICE)
             model.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
             model.eval()
@@ -341,19 +471,15 @@ def run_multi_ensemble():
             probs = []
             names = []
             with torch.no_grad():
-                for x, fnames in tqdm(test_loader, desc=f"  {config['name']} {i+1}", leave=False):
+                for x, fnames in loader:
                     x = x.to(DEVICE)
                     out = F.softmax(model(x), dim=1)
                     probs.append(out.cpu().numpy())
                     names.extend(fnames)
             
             all_probs.append(np.vstack(probs))
-            
-            # Weight based on val score if available
-            if config["val_scores"] and i < len(config["val_scores"]):
-                all_weights.append(config["val_scores"][i])
-            else:
-                all_weights.append(1.0)
+            total_models += 1
+            print("✓")
             
             if file_names is None:
                 file_names = names
@@ -362,19 +488,11 @@ def run_multi_ensemble():
         print("Error: No models loaded!")
         return
     
-    # Normalize weights
-    weights = np.array(all_weights)
-    weights = weights / weights.sum()
-    
+    # Simple average (equal weight for all models)
     print(f"\n--- Ensemble ---")
-    print(f"Total models: {len(all_probs)}")
-    print(f"Weights: {[f'{w:.3f}' for w in weights]}")
+    print(f"Total models: {total_models}")
     
-    # Weighted average
-    avg_probs = np.zeros_like(all_probs[0])
-    for probs, w in zip(all_probs, weights):
-        avg_probs += w * probs
-    
+    avg_probs = np.mean(all_probs, axis=0)
     predictions = [(name, int(np.argmax(avg_probs[i]))) for i, name in enumerate(file_names)]
     
     # Generate submission
@@ -382,9 +500,9 @@ def run_multi_ensemble():
         "ID": range(len(predictions)),
         "TARGET": [pred for _, pred in predictions]
     })
-    submission_df.to_csv("cnn.csv", index=False)
+    submission_df.to_csv("mix.csv", index=False)
     
-    print(f"\nSubmission saved to: cnn.csv")
+    print(f"\nSubmission saved to: mix.csv")
     print(f"Total predictions: {len(submission_df)}")
     print(f"\nClass distribution:")
     print(submission_df["TARGET"].value_counts().sort_index())
@@ -394,4 +512,3 @@ def run_multi_ensemble():
 
 if __name__ == "__main__":
     run_multi_ensemble()
-
