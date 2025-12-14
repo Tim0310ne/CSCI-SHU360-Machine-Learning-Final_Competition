@@ -194,12 +194,13 @@ class AudioResNet(nn.Module):
         return self.fc(x)
 
 
-# --- ResNet18 with SE (3-channel) ---
+# --- ResNet18 with SE (3-channel) - Matching resnet18.py exactly ---
 class SEBlock(nn.Module):
+    """Squeeze-and-Excitation attention (matching resnet18.py)."""
     def __init__(self, channels, reduction=16):
         super().__init__()
-        self.squeeze = nn.AdaptiveAvgPool2d(1)
-        self.excitation = nn.Sequential(
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
             nn.Linear(channels, channels // reduction, bias=False),
             nn.ReLU(inplace=True),
             nn.Linear(channels // reduction, channels, bias=False),
@@ -208,65 +209,64 @@ class SEBlock(nn.Module):
     
     def forward(self, x):
         b, c, _, _ = x.size()
-        y = self.squeeze(x).view(b, c)
-        y = self.excitation(y).view(b, c, 1, 1)
-        return x * y.expand_as(x)
+        y = self.pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
 
 
 class BasicBlockSE(nn.Module):
-    def __init__(self, in_ch, out_ch, stride=1, downsample=None, use_se=True):
+    """ResNet basic block with optional SE attention (matching resnet18.py)."""
+    def __init__(self, in_ch, out_ch, stride=1, use_se=False):
         super().__init__()
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(out_ch)
-        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_ch)
+        
         self.se = SEBlock(out_ch) if use_se else nn.Identity()
-        self.downsample = downsample
-    
-    def forward(self, x):
-        identity = x
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out = self.se(out)
-        if self.downsample:
-            identity = self.downsample(x)
-        return F.relu(out + identity)
-
-
-class ResNet18(nn.Module):
-    """ResNet18 with SE blocks for 3-channel input."""
-    def __init__(self, in_channels=3, num_classes=NUM_CLASSES, use_se=True):
-        super().__init__()
-        self.use_se = use_se
         
-        self.conv1 = nn.Conv2d(in_channels, 64, 3, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.maxpool = nn.MaxPool2d(2, 2)
-        
-        self.layer1 = self._make_layer(64, 64, 2, stride=1)
-        self.layer2 = self._make_layer(64, 128, 2, stride=2)
-        self.layer3 = self._make_layer(128, 256, 2, stride=2)
-        self.layer4 = self._make_layer(256, 512, 2, stride=2)
-        
-        self.avgpool = nn.AdaptiveAvgPool2d(1)
-        self.dropout = nn.Dropout(0.5)
-        self.fc = nn.Linear(512, num_classes)
-    
-    def _make_layer(self, in_ch, out_ch, blocks, stride):
-        downsample = None
+        # Shortcut for dimension mismatch
+        self.shortcut = nn.Sequential()
         if stride != 1 or in_ch != out_ch:
-            downsample = nn.Sequential(
+            self.shortcut = nn.Sequential(
                 nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False),
                 nn.BatchNorm2d(out_ch)
             )
-        layers = [BasicBlockSE(in_ch, out_ch, stride, downsample, self.use_se)]
-        for _ in range(1, blocks):
-            layers.append(BasicBlockSE(out_ch, out_ch, use_se=self.use_se))
+    
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.se(out)
+        out += self.shortcut(x)
+        return F.relu(out)
+
+
+class ResNet18(nn.Module):
+    """ResNet-18 for audio (matching resnet18.py exactly)."""
+    def __init__(self, in_channels=3, num_classes=NUM_CLASSES, use_se=True):
+        super().__init__()
+        
+        self.conv1 = nn.Conv2d(in_channels, 64, 3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        
+        # [2, 2, 2, 2] blocks, SE in layers 2-4
+        self.layer1 = self._make_layer(64, 64, 2, stride=1, use_se=False)
+        self.layer2 = self._make_layer(64, 128, 2, stride=2, use_se=use_se)
+        self.layer3 = self._make_layer(128, 256, 2, stride=2, use_se=use_se)
+        self.layer4 = self._make_layer(256, 512, 2, stride=2, use_se=use_se)
+        
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(0.4)
+        self.fc = nn.Linear(512, num_classes)
+    
+    def _make_layer(self, in_ch, out_ch, num_blocks, stride, use_se):
+        layers = [BasicBlockSE(in_ch, out_ch, stride, use_se)]
+        for _ in range(1, num_blocks):
+            layers.append(BasicBlockSE(out_ch, out_ch, 1, use_se))
         return nn.Sequential(*layers)
     
     def forward(self, x):
         x = F.relu(self.bn1(self.conv1(x)))
-        x = self.maxpool(x)
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
